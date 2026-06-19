@@ -1,0 +1,6 @@
+{
+  "role": "库房签收员",
+  "operator": "王五",
+  "reason": "清点时发现 BV004 不在",
+  "box_codes": ["BV004"]
+}

@@ -1,0 +1,8 @@
+{
+  "role": "库房签收员",
+  "operator": "王五",
+  "reason": "外观完好，温度正常",
+  "received_boxes": ["BV001", "BV002", "BV003"],
+  "missing_boxes": ["BV004"],
+  "missing_reason": "未在运输车辆上找到，疑似遗漏在出发库房"
+}

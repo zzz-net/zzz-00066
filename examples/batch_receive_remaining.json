@@ -1,0 +1,6 @@
+{
+  "role": "库房签收员",
+  "operator": "王五",
+  "reason": "补到箱，外观完好温度正常",
+  "received_boxes": ["BV004"]
+}

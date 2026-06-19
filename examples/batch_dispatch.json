@@ -1,0 +1,6 @@
+{
+  "role": "出库员",
+  "operator": "张三",
+  "reason": "冷链完好，正常出库",
+  "current_temp": 4.0
+}

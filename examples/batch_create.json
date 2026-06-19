@@ -1,0 +1,7 @@
+{
+  "batch_no": "BATCH-VAC-001",
+  "sample_type": "疫苗",
+  "scheduled_outbound_time": "2026-06-20T09:00:00",
+  "estimated_arrival_deadline": "2026-06-20T15:00:00",
+  "operator": "管理员A"
+}

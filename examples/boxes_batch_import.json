@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-VAC-001",
+  "boxes": [
+    {"box_code": "BV001", "sample_type": "疫苗", "current_temp": 4.0},
+    {"box_code": "BV002", "sample_type": "疫苗", "current_temp": 3.5},
+    {"box_code": "BV003", "sample_type": "疫苗", "current_temp": 4.2},
+    {"box_code": "BV004", "sample_type": "疫苗", "current_temp": 5.0}
+  ]
+}

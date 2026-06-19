@@ -350,6 +350,157 @@ def persistence_check():
         api("POST", "/api/boxes/import/json", load("boxes_existing_dup.json")),
         check=lambda b: len(b["rejected"]) == 1)
 
+    section("4. 批次持久化验证")
+    batch_list = api("GET", "/api/batches")["body"]
+    run("重启后批次列表非空",
+        {"status": 200, "body": {"n": len(batch_list)}},
+        check=lambda b: b["n"] >= 1)
+
+    batch001 = api("GET", "/api/batches/BATCH-VAC-001")["body"]
+    run("BATCH-VAC-001 仍为已签收 + 4箱",
+        {"status": 200, "body": {"b": batch001["batch"]}},
+        check=lambda b: (b["b"]["status"] == "已签收"
+                         and b["b"]["total_boxes"] == 4
+                         and b["b"]["received_boxes"] == 4))
+
+    batch_audit = api("GET", "/api/batches/BATCH-VAC-001/audit")["body"]
+    run("批次审计记录持久化（≥8条）",
+        {"status": 200, "body": {"n": len(batch_audit)}},
+        check=lambda b: b["n"] >= 8)
+
+    batch_export = api("GET", "/api/export/json?batch_no=BATCH-VAC-001")["body"]
+    run("批次导出含 batch_summary",
+        {"status": 200, "body": {"has": "batch_summary" in batch_export}},
+        check=lambda b: b["has"])
+
+    run("重启后 已签收批次出库仍 409",
+        api("POST", "/api/batches/BATCH-VAC-001/dispatch", load("batch_dispatch.json")),
+        expect_status=409)
+
+
+def batch_path():
+    header("五、批次管理：创建→导入→出库→到达→签收（含缺失箱）→撤销→补签收")
+
+    section("1. 创建批次 + 批量导入（带预约出库时间、预计到达时限）")
+    run("创建批次 BATCH-VAC-001",
+        api("POST", "/api/batches", load("batch_create.json")),
+        check=lambda b: b.get("ok"))
+
+    run("JSON 导入4箱到批次 (4 imported / 0 rejected)",
+        api("POST", "/api/boxes/import/json", load("boxes_batch_import.json")),
+        check=lambda b: len(b["imported"]) == 4 and len(b["rejected"]) == 0)
+
+    run("批次详情：4箱全部待出库",
+        api("GET", "/api/batches/BATCH-VAC-001"),
+        check=lambda b: (b["batch"]["total_boxes"] == 4
+                         and b["batch"]["status"] == "待出库"
+                         and len(b["pending_todos"]) == 4))
+
+    section("2. 样本类型冲突拦截（同一批次必须同类型）")
+    run("不同样本类型箱子加入批次被拒",
+        api("POST", "/api/boxes/import/json", {
+            "batch_no": "BATCH-VAC-001",
+            "boxes": [{"box_code": "BX-CONFLICT", "sample_type": "血液制品", "current_temp": 3.0}]
+        }),
+        check=lambda b: (len(b["rejected"]) == 1
+                         and "冲突" in b["rejected"][0]["reason"]))
+
+    section("3. 箱子已在其他未完成批次被拦截")
+    api("POST", "/api/batches", {"batch_no": "BATCH-VAC-002", "sample_type": "疫苗"})
+    run("BV001 已在 BATCH-VAC-001，加入 002 被拒",
+        api("POST", "/api/boxes/import/json", {
+            "batch_no": "BATCH-VAC-002",
+            "boxes": [{"box_code": "BV001", "sample_type": "疫苗", "current_temp": 4.0}]
+        }),
+        check=lambda b: any("未完成批次" in r.get("reason", "") or "已存在" in r.get("reason", "")
+                            for r in b["rejected"]))
+
+    section("4. 批次出库 → 转运中 → 待签收")
+    run("批次出库 (出库员 张三)",
+        api("POST", "/api/batches/BATCH-VAC-001/dispatch", load("batch_dispatch.json")),
+        check=lambda b: b["to"] == "转运中" and b["success_count"] == 4)
+
+    run("批次到达 (转运员 李四)",
+        api("POST", "/api/batches/BATCH-VAC-001/arrive", load("batch_arrive.json")),
+        check=lambda b: b["to"] == "待签收")
+
+    section("5. 批次签收：3箱正常签收 + 1箱登记缺失")
+    run("部分签收：3签+1缺 → 部分签收",
+        api("POST", "/api/batches/BATCH-VAC-001/receive", load("batch_receive_partial.json")),
+        check=lambda b: (b["to"] == "部分签收"
+                         and b["received_count"] == 3
+                         and b["missing_registered_count"] == 1))
+
+    run("批次缺失箱数 = 1",
+        api("GET", "/api/batches/BATCH-VAC-001"),
+        check=lambda b: b["batch"]["missing_boxes"] == 1
+                        and b["batch"]["received_boxes"] == 3)
+
+    section("6. 批次审计历史（所有操作都有记录）")
+    audit = api("GET", "/api/batches/BATCH-VAC-001/audit")["body"]
+    run("批次审计 ≥6 条（创建+导入+出库+到达+签收+缺失登记）",
+        {"status": 200, "body": {"n": len(audit)}},
+        check=lambda b: b["n"] >= 6)
+
+    run("审计记录包含操作人、角色、原因",
+        {"status": 200, "body": {"audit": audit}},
+        check=lambda b: all(
+            a.get("operator") and a.get("role") and a.get("action")
+            for a in b["audit"]
+        ))
+
+    section("7. 导出按批次筛选 + 汇总信息")
+    export = api("GET", "/api/export/json?batch_no=BATCH-VAC-001")["body"]
+    run("导出包含 batch_summary",
+        {"status": 200, "body": {"has_summary": "batch_summary" in export}},
+        check=lambda b: b["has_summary"])
+
+    run("batch_summary 含总数/已签收/缺失数",
+        {"status": 200, "body": {"s": export.get("batch_summary", {})}},
+        check=lambda b: (b["s"]["total_boxes"] == 4
+                         and b["s"]["received_boxes"] == 3
+                         and b["s"]["missing_boxes"] == 1))
+
+    section("8. 越权撤销缺失登记 → 403")
+    run("出库员无权撤销缺失 → 403",
+        api("POST", "/api/batches/BATCH-VAC-001/cancel_missing", {
+            "role": "出库员", "operator": "张三",
+            "box_codes": ["BV004"]
+        }),
+        expect_status=403)
+
+    section("9. 管理员撤销缺失登记 → 补签收 → 批次完成")
+    run("管理员撤销 BV004 缺失登记",
+        api("POST", "/api/batches/BATCH-VAC-001/cancel_missing",
+            load("batch_missing_cancel.json")),
+        check=lambda b: b["ok"] and b["cancelled_count"] == 1)
+
+    run("撤销后缺失箱数 = 0",
+        api("GET", "/api/batches/BATCH-VAC-001"),
+        check=lambda b: b["batch"]["missing_boxes"] == 0)
+
+    run("补签收 BV004 → 批次全部已签收",
+        api("POST", "/api/batches/BATCH-VAC-001/receive",
+            load("batch_receive_remaining.json")),
+        check=lambda b: b["to"] == "已签收" and b["received_count"] == 1)
+
+    run("批次状态：已签收（终态）",
+        api("GET", "/api/batches/BATCH-VAC-001"),
+        check=lambda b: b["batch"]["status"] == "已签收"
+                        and b["batch"]["received_boxes"] == 4)
+
+    section("10. 批次终态校验：已签收批次不能再操作")
+    run("已签收批次再出库 → 409",
+        api("POST", "/api/batches/BATCH-VAC-001/dispatch",
+            load("batch_dispatch.json")),
+        expect_status=409)
+
+    section("11. CSV 导出按批次筛选")
+    csv_resp = api("GET", "/api/export/csv?batch_no=BATCH-VAC-001", raw=True)
+    run("CSV 导出按批次筛选 HTTP 200",
+        csv_resp,
+        check=lambda b: isinstance(b, str) and "BV001" in b)
+
 
 def print_summary():
     print()
@@ -376,7 +527,7 @@ def main():
         print("         请先运行: uvicorn app.main:app --port 8000")
         sys.exit(2)
 
-    modes = set(sys.argv[1:]) or {"happy", "failure", "admin"}
+    modes = set(sys.argv[1:]) or {"happy", "failure", "admin", "batch"}
 
     if "happy" in modes:
         happy_path()
@@ -384,6 +535,8 @@ def main():
         failure_path()
     if "admin" in modes:
         admin_and_export()
+    if "batch" in modes:
+        batch_path()
     if "persistence" in modes:
         persistence_check()
 

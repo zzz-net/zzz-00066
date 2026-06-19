@@ -43,7 +43,8 @@ def init_db():
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 dispatch_at TEXT,
-                receive_at TEXT
+                receive_at TEXT,
+                batch_no TEXT
             )
             """
         )
@@ -58,7 +59,69 @@ def init_db():
                 operator TEXT NOT NULL,
                 reason TEXT,
                 temp_at_action REAL,
+                created_at TEXT NOT NULL,
+                batch_no TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batches (
+                batch_no TEXT PRIMARY KEY,
+                sample_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '待出库',
+                scheduled_outbound_time TEXT,
+                estimated_arrival_deadline TEXT,
+                total_boxes INTEGER NOT NULL DEFAULT 0,
+                received_boxes INTEGER NOT NULL DEFAULT 0,
+                missing_boxes INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                created_by TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL,
+                box_code TEXT NOT NULL,
+                box_batch_status TEXT NOT NULL DEFAULT '正常',
+                received_at TEXT,
+                missing_reason TEXT,
+                missing_registered_at TEXT,
+                missing_registered_by TEXT,
+                UNIQUE(batch_no, box_code)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL,
+                box_code TEXT,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
                 created_at TEXT NOT NULL
             )
             """
         )
+        _migrate_db(conn)
+
+
+def _migrate_db(conn):
+    try:
+        conn.execute("ALTER TABLE boxes ADD COLUMN batch_no TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE audit_log ADD COLUMN batch_no TEXT")
+    except sqlite3.OperationalError:
+        pass
