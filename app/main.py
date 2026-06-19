@@ -3381,8 +3381,12 @@ def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
             "rejected_reason = NULL",
             "withdrawn_at = NULL", "withdrawn_by = NULL", "withdrawn_reason = NULL",
             "resubmitted_at = ?", "resubmitted_by = ?",
+            "current_handler = ?", "current_handler_role = ?",
         ]
-        params = [now, now, req.operator]
+        params = [
+            now, now, req.operator,
+            ticket["initiator"], ticket["initiator_role"],
+        ]
 
         if req.description:
             update_fields.append("description = ?")
@@ -3395,7 +3399,9 @@ def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
             params,
         )
 
-        detail_parts = [f"发起人重新提交处置单，当前处理人重置为: {ticket['initiator']}"]
+        detail_parts = [
+            f"发起人重新提交处置单，责任归属重新判定，处理人从 {ticket['current_handler']} 重置为发起人 {ticket['initiator']}"
+        ]
         if req.description:
             detail_parts.append(f"补充描述: {req.description}")
 

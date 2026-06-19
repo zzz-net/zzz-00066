@@ -634,6 +634,7 @@ python test_dispute_comprehensive.py
 
 - **重复报单拦截**：同批次号 + 同箱号 + 同原因分类的活跃（待处理/处理中）工单不可重复创建，409 拦截
 - **撤回后重提重新校验权限**：重提时再次校验 `operator == initiator`，同时检查是否存在重复报单
+- **重提时责任归属重新判定**：转交后被撤回再提交时，`current_handler` 重置为发起人，不残留上次转交的处理人
 - **配置切换只影响新单**：`allow_proxy_record` 变更仅影响新建工单，已有工单的 `allow_proxy_record_at_create` 冻结不变
 - **越权操作全面拦截**：撤回、重提、重新提交严格校验 `operator == initiator`，同角色不同人一律 403
 

@@ -465,6 +465,72 @@ def main():
     })
     test("重提时检测到活跃工单被拦截", status, expected_status=409)
 
+    print()
+    print("  3.7 转交后撤回重提，责任归属重新判定")
+    boxes3d, _, _ = create_full_batch("BATCH-EXC-003D", 2, "FB")
+    status, data = api("POST", "/api/exception/tickets", {
+        "batch_no": "BATCH-EXC-003D",
+        "box_code": "FB001",
+        "reason_category": "温度异常",
+        "description": "测试转交后撤回重提责任重置",
+        "role": "库房管理员", "operator": "孙管理",
+    })
+    ticket3d_id = data["ticket_id"]
+    test("创建工单成功，处理人为发起人", status,
+         check=data.get("current_handler") == "孙管理")
+
+    api("POST", f"/api/exception/tickets/{ticket3d_id}/confirm", {
+        "role": "仓库主管", "operator": "赵主管",
+    })
+
+    status, data = api("POST", f"/api/exception/tickets/{ticket3d_id}/transfer", {
+        "target_handler": "钱质控",
+        "target_handler_role": "质控",
+        "transfer_reason": "需要专业分析",
+        "role": "仓库主管", "operator": "赵主管",
+    })
+    test("转交责任人成功", status, check=data.get("to_handler") == "钱质控")
+
+    status, data = api("GET", f"/api/exception/tickets/{ticket3d_id}")
+    test("转交后处理人为钱质控", status,
+         check=(data["current_handler"] == "钱质控"
+                and data["current_handler_role"] == "质控"
+                and len(data["transfer_history"]) == 1))
+
+    status, data = api("POST", f"/api/exception/tickets/{ticket3d_id}/withdraw", {
+        "role": "库房管理员", "operator": "孙管理",
+        "reason": "需要重新整理材料",
+    })
+    test("发起人撤回成功", status, check=data.get("status") == "已撤回")
+
+    status, data = api("POST", f"/api/exception/tickets/{ticket3d_id}/resubmit", {
+        "role": "库房管理员", "operator": "孙管理",
+        "description": "补充：已整理完整温度曲线数据",
+        "reason": "材料已备齐",
+    })
+    test("重提成功，状态变回待处理", status, check=data.get("status") == "待处理")
+
+    status, data = api("GET", f"/api/exception/tickets/{ticket3d_id}")
+    test("重提后处理人重置为发起人，不残留上次转交人", status,
+         check=(data["current_handler"] == "孙管理"
+                and data["current_handler_role"] == "库房管理员"
+                and data["resubmitted_by"] == "孙管理"))
+
+    status, data = api("POST", f"/api/exception/tickets/{ticket3d_id}/confirm", {
+        "role": "仓库主管", "operator": "赵主管",
+    })
+    test("重提后可重新确认", status, check=data.get("status") == "处理中")
+
+    status, audit = api("GET", f"/api/exception/tickets/{ticket3d_id}/audit")
+    actions = [a["action"] for a in audit]
+    test("审计日志包含完整流转链路", status,
+         check=("创建处置单" in actions
+                and "确认处置单" in actions
+                and "转交责任人" in actions
+                and "撤回处置单" in actions
+                and "重新提交处置单" in actions
+                and "确认处置单" in actions))
+
     # ==================================================================
     print()
     print("=== 场景4: 配置切换（代录开关） ===")
