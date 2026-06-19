@@ -1,0 +1,6 @@
+{
+  "boxes": [
+    {"box_code":"BOX-DUP1","sample_type":"疫苗","current_temp":4.0},
+    {"box_code":"BOX-DUP1","sample_type":"疫苗","current_temp":4.0}
+  ]
+}

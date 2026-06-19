@@ -351,25 +351,73 @@ def list_audit(box_code: str = None):
 # ── Export ────────────────────────────────────────────────────────────────────
 
 
+EXPORT_FIELDS = [
+    "box_code",
+    "sample_type",
+    "sequence",
+    "from_status",
+    "to_status",
+    "role",
+    "operator",
+    "reason",
+    "temp_at_action",
+    "action_at",
+    "current_status",
+]
+
+
+def _build_export_rows():
+    with get_db() as conn:
+        audits = conn.execute(
+            "SELECT * FROM audit_log ORDER BY box_code, id"
+        ).fetchall()
+        boxes = {
+            r["box_code"]: dict(r)
+            for r in conn.execute("SELECT * FROM boxes").fetchall()
+        }
+    rows = []
+    seq_by_box = {}
+    for a in audits:
+        bc = a["box_code"]
+        seq_by_box[bc] = seq_by_box.get(bc, 0) + 1
+        box_info = boxes.get(bc, {})
+        rows.append(
+            {
+                "box_code": bc,
+                "sample_type": box_info.get("sample_type", ""),
+                "sequence": seq_by_box[bc],
+                "from_status": a["from_status"] or "",
+                "to_status": a["to_status"],
+                "role": a["role"],
+                "operator": a["operator"],
+                "reason": a["reason"] or "",
+                "temp_at_action": "" if a["temp_at_action"] is None else a["temp_at_action"],
+                "action_at": a["created_at"],
+                "current_status": box_info.get("status", ""),
+            }
+        )
+    return rows
+
+
 @app.get("/api/export/json")
 def export_json():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM boxes").fetchall()
-    return [dict(r) for r in rows]
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "fields": EXPORT_FIELDS,
+        "rows": _build_export_rows(),
+    }
 
 
 @app.get("/api/export/csv")
 def export_csv():
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM boxes").fetchall()
+    rows = _build_export_rows()
     output = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(output, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(dict(row))
+    writer = csv.DictWriter(output, fieldnames=EXPORT_FIELDS)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
     return StreamingResponse(
         io.BytesIO(output.getvalue().encode("utf-8-sig")),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=boxes.csv"},
+        headers={"Content-Disposition": "attachment; filename=cold_chain_history.csv"},
     )

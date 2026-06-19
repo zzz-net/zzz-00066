@@ -1,0 +1,8 @@
+{
+  "boxes": [
+    {"box_code":"BOX-V001","sample_type":"疫苗","current_temp":4.0},
+    {"box_code":"BOX-V002","sample_type":"疫苗","current_temp":3.5},
+    {"box_code":"BOX-B001","sample_type":"血液制品","current_temp":2.0},
+    {"box_code":"BOX-R001","sample_type":"试剂","current_temp":-18.0}
+  ]
+}
