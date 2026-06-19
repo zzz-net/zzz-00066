@@ -833,3 +833,14 @@ zzz-00066/
 | 缺少代理提交能力 | 班组长无法代一线员工补录异常单 | 新增 `allow_proxy_submit` 配置和 `on_behalf_of` 参数，代理提交时 `created_by` 设为被代理人，`submitted_by` 记录实际提交人 |
 | **同角色不同人可越权撤回/重开/重新提交** | 撤回/重开/重新提交使用 `operator != created_by AND role != created_role` 的 OR 逻辑，同角色不同人可绕过 | 改为 `operator != created_by` 严格匹配创建人本人，同角色不同人不再放行 |
 | 代理提交配置回写历史单 | 切换配置后已有代理工单可能受影响 | `allow_proxy_submit` 配置仅控制新建时是否允许代理提交，已有工单的 `proxy_submitted` 标记不受配置变更影响 |
+| 发起人/代录人/处理人三字段混用 | 历史上只有一个「创建人」字段，无法区分真正发起人和代录人 | 新增 `exception_tickets` 主表三字段分离：`initiator`（发起人）、`proxy_recorder`（代录人）、`current_handler`（当前处理人），各自独立角色字段 |
+| 异常单缺少批次/箱号信息 | 无法关联到具体的物流批次或具体箱子 | `exception_tickets` 表新增 `batch_no`、`box_code`、`reason_category` 核心业务字段，支持批次维度汇总查询 |
+| 缺少图片/文字证据 | 异常没有证据链，处置缺乏依据 | 独立 `exception_evidence` 表，支持 `evidence_type=text/image`，记录证据内容、提交人、提交时间 |
+| 操作无流水记录 | 无法追溯谁在何时做了什么 | 独立 `exception_audit_log` 表，每次状态变更、证据补充、转交都写入审计日志 |
+| 无法转交责任人 | 异常责任不能在不同角色间流转 | 新增 `exception_handler_transfers` 表 + `/transfer` 接口，每次转交完整记录：转出人/转入人/转交原因/转交人/时间 |
+| 导出看不到责任流转 | CSV 只有当前处理人，无法追溯责任链 | CSV 导出新增 `responsibility_transfers` 链状字段：`初始:发起人(角色) → A→B(角色)[转交人@时间] → ... → 当前:处理人(角色)`，JSON 导出含完整 `responsibility_chain` 列表 |
+| 代录无配置开关 | 不能灵活控制是否允许班组长代录 | 独立 `exception_config` 表单例配置 `allow_proxy_record`，新建时冻结 `allow_proxy_record_at_create` 到工单，配置变更只影响新单 |
+| 同箱号同原因重复报单 | 同一异常被反复建单造成管理混乱 | 创建和重提时检查 `batch_no+box_code+reason_category` + 活跃状态（待处理/处理中），冲突返回 409 拦截 |
+| 撤回后重提权限校验不严 | 同角色不同人可能越权重开他人工单 | 重提时再次严格校验 `operator == initiator`，同时重新检查重复报单拦截 |
+| 异常单重启丢失 | 处理中状态无法持久化 | 所有表（5张）使用 SQLite WAL 模式持久化，`init_db()` 自动重建表结构，服务重启后状态完整恢复 |
+| 越权操作无拦截 | 同角色不同人可随意操作他人工单 | 撤回/重提/重新提交严格 `operator == initiator`，其他操作按角色白名单控制，越权一律 403 |
