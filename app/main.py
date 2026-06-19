@@ -6,6 +6,21 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 
 from app.database import get_db, init_db, recover_proxy_report_integrity
+from app.ticket_service import (
+    TicketType,
+    check_duplicate_ticket,
+    compute_responsibility,
+    recompute_responsibility_on_resubmit,
+    build_detail,
+    list_tickets,
+    log_ticket_audit,
+    log_handler_transfer,
+    build_export_json_row,
+    build_export_csv_row,
+    build_export_csv_fields,
+    get_duplicate_error_msg,
+    get_audit_log,
+)
 from app.models import (
     BoxImportItem,
     BoxImportJSON,
@@ -2960,14 +2975,9 @@ def _get_exception_config(conn):
 
 def _log_exception_audit(conn, ticket_id, action, from_status, to_status,
                          role, operator, reason, detail, created_at):
-    conn.execute(
-        """
-        INSERT INTO exception_audit_log (ticket_id, action, from_status, to_status,
-                                         role, operator, reason, detail, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (ticket_id, action, from_status, to_status,
-         role, operator, reason, detail, created_at),
+    log_ticket_audit(
+        conn, TicketType.EXCEPTION, ticket_id, action,
+        from_status, to_status, role, operator, reason, detail, created_at
     )
 
 
@@ -2978,74 +2988,15 @@ def _get_exception_ticket(conn, ticket_id):
 
 
 def _build_exception_ticket_detail(conn, ticket):
-    evidence = conn.execute(
-        "SELECT * FROM exception_evidence WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    transfers = conn.execute(
-        "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    audit = conn.execute(
-        "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    return {
-        "id": ticket["id"],
-        "ticket_no": ticket["ticket_no"],
-        "batch_no": ticket["batch_no"],
-        "box_code": ticket["box_code"],
-        "reason_category": ticket["reason_category"],
-        "description": ticket["description"],
-        "status": ticket["status"],
-        "conclusion": ticket["conclusion"],
-        "allow_proxy_record_at_create": bool(ticket["allow_proxy_record_at_create"]),
-        "initiator": ticket["initiator"],
-        "initiator_role": ticket["initiator_role"],
-        "proxy_recorder": ticket["proxy_recorder"],
-        "proxy_recorder_role": ticket["proxy_recorder_role"],
-        "current_handler": ticket["current_handler"],
-        "current_handler_role": ticket["current_handler_role"],
-        "created_at": ticket["created_at"],
-        "updated_at": ticket["updated_at"],
-        "withdrawn_at": ticket["withdrawn_at"],
-        "withdrawn_by": ticket["withdrawn_by"],
-        "withdrawn_reason": ticket["withdrawn_reason"],
-        "resubmitted_at": ticket["resubmitted_at"],
-        "resubmitted_by": ticket["resubmitted_by"],
-        "rejected_at": ticket["rejected_at"],
-        "rejected_by": ticket["rejected_by"],
-        "rejected_role": ticket["rejected_role"],
-        "rejected_reason": ticket["rejected_reason"],
-        "closed_at": ticket["closed_at"],
-        "closed_by": ticket["closed_by"],
-        "closed_role": ticket["closed_role"],
-        "evidence_list": [dict(e) for e in evidence],
-        "transfer_history": [dict(t) for t in transfers],
-        "audit_log": [dict(a) for a in audit],
-    }
+    detail = build_detail(conn, TicketType.EXCEPTION, ticket)
+    detail["audit_log"] = [dict(a) for a in get_audit_log(conn, TicketType.EXCEPTION, ticket["id"])]
+    return detail
 
 
 def _check_duplicate_exception(conn, batch_no, box_code, reason_category, exclude_ticket_id=None):
-    query = """
-        SELECT * FROM exception_tickets
-        WHERE reason_category = ? AND status IN ('待处理', '处理中')
-    """
-    params = [reason_category]
-    if batch_no:
-        query += " AND batch_no = ?"
-        params.append(batch_no)
-    else:
-        query += " AND batch_no IS NULL"
-    if box_code:
-        query += " AND box_code = ?"
-        params.append(box_code)
-    else:
-        query += " AND box_code IS NULL"
-    if exclude_ticket_id is not None:
-        query += " AND id != ?"
-        params.append(exclude_ticket_id)
-    return conn.execute(query, params).fetchone()
+    return check_duplicate_ticket(
+        conn, TicketType.EXCEPTION, box_code, reason_category, exclude_ticket_id
+    )
 
 
 @app.get("/api/exception/config")
@@ -3125,17 +3076,19 @@ def create_exception_ticket(data: ExceptionTicketCreate):
 
         dup = _check_duplicate_exception(conn, data.batch_no, data.box_code, data.reason_category)
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同批次/箱号+原因分类的活跃处置单（工单号: {dup['ticket_no']}），请勿重复报单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.EXCEPTION, dup))
 
-        initiator = data.on_behalf_of if is_proxy else data.operator
-        initiator_role = data.role if not is_proxy else None
-        proxy_recorder = data.operator if is_proxy else None
-        proxy_recorder_role = data.role if is_proxy else None
-        current_handler = initiator
-        current_handler_role = data.role
+        resp = compute_responsibility(
+            TicketType.EXCEPTION, data.operator, data.role,
+            data.on_behalf_of, None
+        )
+        initiator = resp["originator"]
+        initiator_role = resp["originator_role"]
+        proxy_recorder = resp["proxy_recorder"]
+        proxy_recorder_role = resp["proxy_recorder_role"]
+        current_handler = resp["current_handler"]
+        current_handler_role = resp["current_handler_role"]
+        is_proxy = resp["is_proxy"]
 
         now = datetime.now().isoformat()
         ticket_no = f"EXC-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -3151,7 +3104,7 @@ def create_exception_ticket(data: ExceptionTicketCreate):
             """,
             (ticket_no, data.batch_no, data.box_code, data.reason_category,
              data.description, 1 if allow_proxy else 0,
-             initiator, initiator_role if initiator_role else data.role,
+             initiator, initiator_role,
              proxy_recorder, proxy_recorder_role,
              current_handler, current_handler_role,
              now, now),
@@ -3193,22 +3146,7 @@ def create_exception_ticket(data: ExceptionTicketCreate):
 @app.get("/api/exception/tickets")
 def list_exception_tickets(status: str = None, batch_no: str = None, box_code: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM exception_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        rows = conn.execute(query, params).fetchall()
+        rows = list_tickets(conn, TicketType.EXCEPTION, status, batch_no, box_code)
     return [dict(r) for r in rows]
 
 
@@ -3389,10 +3327,12 @@ def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
             exclude_ticket_id=ticket_id
         )
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同批次/箱号+原因分类的活跃处置单（工单号: {dup['ticket_no']}），请勿重复报单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.EXCEPTION, dup))
+
+        handler_reset = recompute_responsibility_on_resubmit(TicketType.EXCEPTION, ticket)
+        new_handler = handler_reset["current_handler"]
+        new_handler_role = handler_reset["current_handler_role"]
+        old_handler = ticket["current_handler"]
 
         update_fields = [
             "status = '待处理'", "updated_at = ?",
@@ -3404,7 +3344,7 @@ def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
         ]
         params = [
             now, now, req.operator,
-            ticket["initiator"], ticket["initiator_role"],
+            new_handler, new_handler_role,
         ]
 
         if req.description:
@@ -3419,7 +3359,7 @@ def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
         )
 
         detail_parts = [
-            f"发起人重新提交处置单，责任归属重新判定，处理人从 {ticket['current_handler']} 重置为发起人 {ticket['initiator']}"
+            f"发起人重新提交处置单，责任归属重新判定，处理人从 {old_handler} 重置为发起人 {new_handler}"
         ]
         if req.description:
             detail_parts.append(f"补充描述: {req.description}")
@@ -3518,16 +3458,11 @@ def transfer_exception_ticket(ticket_id: int, req: ExceptionTransferRequest):
             (req.target_handler, req.target_handler_role, now, ticket_id),
         )
 
-        conn.execute(
-            """
-            INSERT INTO exception_handler_transfers (
-                ticket_id, from_handler, from_handler_role, to_handler, to_handler_role,
-                transferred_by, transferred_role, transfer_reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (ticket_id, from_handler, from_handler_role,
-             req.target_handler, req.target_handler_role,
-             req.operator, req.role, req.transfer_reason, now),
+        log_handler_transfer(
+            conn, TicketType.EXCEPTION, ticket_id,
+            from_handler, from_handler_role,
+            req.target_handler, req.target_handler_role,
+            req.operator, req.role, req.transfer_reason, now
         )
 
         _log_exception_audit(
@@ -3597,11 +3532,7 @@ def get_exception_audit(ticket_id: int):
         ticket = _get_exception_ticket(conn, ticket_id)
         if not ticket:
             raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
-
-        rows = conn.execute(
-            "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
-            (ticket_id,),
-        ).fetchall()
+        rows = get_audit_log(conn, TicketType.EXCEPTION, ticket_id)
     return [dict(r) for r in rows]
 
 
@@ -3655,97 +3586,8 @@ def get_batch_exception_summary(batch_no: str):
 @app.get("/api/exception/export/json")
 def export_exception_json(status: str = None, batch_no: str = None, box_code: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM exception_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        result_rows = []
-        for t in tickets:
-            evidence = conn.execute(
-                "SELECT * FROM exception_evidence WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            transfers = conn.execute(
-                "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            audit = conn.execute(
-                "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-
-            transfer_chain = []
-            transfer_chain.append({
-                "handler": t["initiator"],
-                "handler_role": t["initiator_role"],
-                "action": "初始责任人",
-                "at": t["created_at"],
-            })
-            for tr in transfers:
-                transfer_chain.append({
-                    "from_handler": tr["from_handler"],
-                    "from_handler_role": tr["from_handler_role"],
-                    "to_handler": tr["to_handler"],
-                    "to_handler_role": tr["to_handler_role"],
-                    "transferred_by": tr["transferred_by"],
-                    "transferred_role": tr["transferred_role"],
-                    "transfer_reason": tr["transfer_reason"],
-                    "at": tr["created_at"],
-                })
-            transfer_chain.append({
-                "handler": t["current_handler"],
-                "handler_role": t["current_handler_role"],
-                "action": "当前责任人",
-                "at": t["updated_at"],
-            })
-
-            result_rows.append({
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"],
-                "box_code": t["box_code"],
-                "reason_category": t["reason_category"],
-                "description": t["description"],
-                "status": t["status"],
-                "conclusion": t["conclusion"],
-                "allow_proxy_record_at_create": bool(t["allow_proxy_record_at_create"]),
-                "initiator": t["initiator"],
-                "initiator_role": t["initiator_role"],
-                "proxy_recorder": t["proxy_recorder"],
-                "proxy_recorder_role": t["proxy_recorder_role"],
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_at": t["withdrawn_at"],
-                "withdrawn_by": t["withdrawn_by"],
-                "withdrawn_reason": t["withdrawn_reason"],
-                "resubmitted_at": t["resubmitted_at"],
-                "resubmitted_by": t["resubmitted_by"],
-                "rejected_at": t["rejected_at"],
-                "rejected_by": t["rejected_by"],
-                "rejected_reason": t["rejected_reason"],
-                "closed_at": t["closed_at"],
-                "closed_by": t["closed_by"],
-                "closed_role": t["closed_role"],
-                "evidence_list": [dict(e) for e in evidence],
-                "transfer_history": [dict(tr) for tr in transfers],
-                "responsibility_chain": transfer_chain,
-                "audit_log": [dict(a) for a in audit],
-            })
+        tickets = list_tickets(conn, TicketType.EXCEPTION, status, batch_no, box_code)
+        result_rows = [build_export_json_row(conn, TicketType.EXCEPTION, t) for t in tickets]
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -3757,90 +3599,13 @@ def export_exception_json(status: str = None, batch_no: str = None, box_code: st
 @app.get("/api/exception/export/csv")
 def export_exception_csv(status: str = None, batch_no: str = None, box_code: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM exception_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        fields = [
-            "ticket_id", "ticket_no", "batch_no", "box_code",
-            "reason_category", "description", "status", "conclusion",
-            "initiator", "initiator_role",
-            "proxy_recorder", "proxy_recorder_role",
-            "current_handler", "current_handler_role",
-            "responsibility_transfers",
-            "created_at", "updated_at",
-            "withdrawn_by", "withdrawn_at", "withdrawn_reason",
-            "rejected_by", "rejected_at", "rejected_reason",
-            "closed_by", "closed_at", "closed_role",
-            "evidence_count",
-        ]
-
+        tickets = list_tickets(conn, TicketType.EXCEPTION, status, batch_no, box_code)
+        fields = build_export_csv_fields(TicketType.EXCEPTION)
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
-
         for t in tickets:
-            transfers = conn.execute(
-                "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            evidence = conn.execute(
-                "SELECT COUNT(*) as cnt FROM exception_evidence WHERE ticket_id = ?",
-                (t["id"],),
-            ).fetchone()
-
-            transfer_parts = []
-            transfer_parts.append(f"初始:{t['initiator']}({t['initiator_role']})")
-            for tr in transfers:
-                transfer_parts.append(
-                    f"{tr['from_handler']}→{tr['to_handler']}({tr['to_handler_role']})"
-                    f"[{tr['transferred_by']}@{tr['created_at'][:19]}]"
-                )
-            transfer_parts.append(f"当前:{t['current_handler']}({t['current_handler_role']})")
-            transfer_str = " → ".join(transfer_parts)
-
-            row = {
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"] or "",
-                "box_code": t["box_code"] or "",
-                "reason_category": t["reason_category"],
-                "description": t["description"] or "",
-                "status": t["status"],
-                "conclusion": t["conclusion"] or "",
-                "initiator": t["initiator"],
-                "initiator_role": t["initiator_role"] or "",
-                "proxy_recorder": t["proxy_recorder"] or "",
-                "proxy_recorder_role": t["proxy_recorder_role"] or "",
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "responsibility_transfers": transfer_str,
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_by": t["withdrawn_by"] or "",
-                "withdrawn_at": t["withdrawn_at"] or "",
-                "withdrawn_reason": t["withdrawn_reason"] or "",
-                "rejected_by": t["rejected_by"] or "",
-                "rejected_at": t["rejected_at"] or "",
-                "rejected_reason": t["rejected_reason"] or "",
-                "closed_by": t["closed_by"] or "",
-                "closed_at": t["closed_at"] or "",
-                "closed_role": t["closed_role"] or "",
-                "evidence_count": evidence["cnt"],
-            }
+            row = build_export_csv_row(conn, TicketType.EXCEPTION, t)
             writer.writerow(row)
 
     return StreamingResponse(
@@ -3878,14 +3643,9 @@ def _get_liability_config(conn):
 
 def _log_liability_audit(conn, ticket_id, action, from_status, to_status,
                          role, operator, reason, detail, created_at):
-    conn.execute(
-        """
-        INSERT INTO liability_audit_log (ticket_id, action, from_status, to_status,
-                                         role, operator, reason, detail, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (ticket_id, action, from_status, to_status,
-         role, operator, reason, detail, created_at),
+    log_ticket_audit(
+        conn, TicketType.LIABILITY, ticket_id, action, from_status, to_status,
+        role, operator, reason, detail, created_at
     )
 
 
@@ -3896,74 +3656,15 @@ def _get_liability_ticket(conn, ticket_id):
 
 
 def _build_liability_ticket_detail(conn, ticket):
-    evidence = conn.execute(
-        "SELECT * FROM liability_evidence WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    transfers = conn.execute(
-        "SELECT * FROM liability_handler_transfers WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    audit = conn.execute(
-        "SELECT * FROM liability_audit_log WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    return {
-        "id": ticket["id"],
-        "ticket_no": ticket["ticket_no"],
-        "batch_no": ticket["batch_no"],
-        "box_code": ticket["box_code"],
-        "reason_category": ticket["reason_category"],
-        "description": ticket["description"],
-        "status": ticket["status"],
-        "conclusion": ticket["conclusion"],
-        "allow_proxy_record_at_create": bool(ticket["allow_proxy_record_at_create"]),
-        "reporter": ticket["reporter"],
-        "reporter_role": ticket["reporter_role"],
-        "proxy_recorder": ticket["proxy_recorder"],
-        "proxy_recorder_role": ticket["proxy_recorder_role"],
-        "current_handler": ticket["current_handler"],
-        "current_handler_role": ticket["current_handler_role"],
-        "created_at": ticket["created_at"],
-        "updated_at": ticket["updated_at"],
-        "withdrawn_at": ticket["withdrawn_at"],
-        "withdrawn_by": ticket["withdrawn_by"],
-        "withdrawn_reason": ticket["withdrawn_reason"],
-        "resubmitted_at": ticket["resubmitted_at"],
-        "resubmitted_by": ticket["resubmitted_by"],
-        "rejected_at": ticket["rejected_at"],
-        "rejected_by": ticket["rejected_by"],
-        "rejected_role": ticket["rejected_role"],
-        "rejected_reason": ticket["rejected_reason"],
-        "closed_at": ticket["closed_at"],
-        "closed_by": ticket["closed_by"],
-        "closed_role": ticket["closed_role"],
-        "evidence_list": [dict(e) for e in evidence],
-        "transfer_history": [dict(t) for t in transfers],
-        "audit_log": [dict(a) for a in audit],
-    }
+    detail = build_detail(conn, TicketType.LIABILITY, ticket)
+    detail["audit_log"] = [dict(a) for a in get_audit_log(conn, TicketType.LIABILITY, ticket["id"])]
+    return detail
 
 
 def _check_duplicate_liability(conn, batch_no, box_code, reason_category, exclude_ticket_id=None):
-    query = """
-        SELECT * FROM liability_tickets
-        WHERE reason_category = ? AND status IN ('待处理', '处理中')
-    """
-    params = [reason_category]
-    if batch_no:
-        query += " AND batch_no = ?"
-        params.append(batch_no)
-    else:
-        query += " AND batch_no IS NULL"
-    if box_code:
-        query += " AND box_code = ?"
-        params.append(box_code)
-    else:
-        query += " AND box_code IS NULL"
-    if exclude_ticket_id is not None:
-        query += " AND id != ?"
-        params.append(exclude_ticket_id)
-    return conn.execute(query, params).fetchone()
+    return check_duplicate_ticket(
+        conn, TicketType.LIABILITY, box_code, reason_category, exclude_ticket_id
+    )
 
 
 @app.get("/api/liability/config")
@@ -4043,17 +3744,20 @@ def create_liability_ticket(data: LiabilityTicketCreate):
 
         dup = _check_duplicate_liability(conn, data.batch_no, data.box_code, data.reason_category)
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同批次/箱号+原因分类的活跃责任追踪单（工单号: {dup['ticket_no']}），请勿重复报单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.LIABILITY, dup))
 
-        reporter = data.on_behalf_of if is_proxy else data.operator
-        reporter_role = data.role if not is_proxy else None
-        proxy_recorder = data.operator if is_proxy else None
-        proxy_recorder_role = data.role if is_proxy else None
-        current_handler = reporter
-        current_handler_role = data.role
+        resp = compute_responsibility(
+            TicketType.LIABILITY, data.operator, data.role,
+            data.on_behalf_of if is_proxy else None,
+            None
+        )
+        reporter = resp["originator"]
+        reporter_role = resp["originator_role"]
+        proxy_recorder = resp["proxy_recorder"]
+        proxy_recorder_role = resp["proxy_recorder_role"]
+        current_handler = resp["current_handler"]
+        current_handler_role = resp["current_handler_role"]
+        is_proxy = resp["is_proxy"]
 
         now = datetime.now().isoformat()
         ticket_no = f"LIAB-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -4069,7 +3773,7 @@ def create_liability_ticket(data: LiabilityTicketCreate):
             """,
             (ticket_no, data.batch_no, data.box_code, data.reason_category,
              data.description, 1 if allow_proxy else 0,
-             reporter, reporter_role if reporter_role else data.role,
+             reporter, reporter_role,
              proxy_recorder, proxy_recorder_role,
              current_handler, current_handler_role,
              now, now),
@@ -4092,7 +3796,7 @@ def create_liability_ticket(data: LiabilityTicketCreate):
             conn, ticket_id, "创建责任追踪单", None, "待处理",
             data.role, data.operator, data.description,
             f"原因分类: {data.reason_category}，关联批次: {data.batch_no or '无'}，关联箱号: {data.box_code or '无'}"
-            f"，报单人: {reporter}（责任岗位: {reporter_role if reporter_role else data.role}）"
+            f"，报单人: {reporter}（责任岗位: {reporter_role}）"
             f"，当前处理人: {current_handler}（{current_handler_role}）{proxy_detail}",
             now,
         )
@@ -4103,7 +3807,7 @@ def create_liability_ticket(data: LiabilityTicketCreate):
         "ticket_no": ticket_no,
         "status": "待处理",
         "reporter": reporter,
-        "reporter_role": reporter_role if reporter_role else data.role,
+        "reporter_role": reporter_role,
         "proxy_recorder": proxy_recorder,
         "current_handler": current_handler,
         "current_handler_role": current_handler_role,
@@ -4115,28 +3819,13 @@ def create_liability_ticket(data: LiabilityTicketCreate):
 def list_liability_tickets(status: str = None, batch_no: str = None, box_code: str = None,
                            reporter_role: str = None, current_handler_role: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM liability_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if reporter_role:
-            conditions.append("reporter_role = ?")
-            params.append(reporter_role)
+            extra_filters["reporter_role"] = reporter_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        rows = conn.execute(query, params).fetchall()
+            extra_filters["current_handler_role"] = current_handler_role
+        rows = list_tickets(conn, TicketType.LIABILITY, status, batch_no, box_code,
+                            extra_filters=extra_filters)
     return [dict(r) for r in rows]
 
 
@@ -4317,13 +4006,12 @@ def resubmit_liability_ticket(ticket_id: int, req: LiabilityResubmitRequest):
             exclude_ticket_id=ticket_id
         )
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同批次/箱号+原因分类的活跃责任追踪单（工单号: {dup['ticket_no']}），请勿重复报单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.LIABILITY, dup))
 
+        handler_reset = recompute_responsibility_on_resubmit(TicketType.LIABILITY, ticket)
+        new_handler = handler_reset["current_handler"]
+        new_handler_role = handler_reset["current_handler_role"]
         old_handler = ticket["current_handler"]
-        old_handler_role = ticket["current_handler_role"]
 
         update_fields = [
             "status = '待处理'", "updated_at = ?",
@@ -4335,7 +4023,7 @@ def resubmit_liability_ticket(ticket_id: int, req: LiabilityResubmitRequest):
         ]
         params = [
             now, now, req.operator,
-            ticket["reporter"], ticket["reporter_role"],
+            new_handler, new_handler_role,
         ]
 
         if req.description:
@@ -4350,7 +4038,7 @@ def resubmit_liability_ticket(ticket_id: int, req: LiabilityResubmitRequest):
         )
 
         detail_parts = [
-            f"报单人重新提交责任追踪单，责任归属重新判定，处理人从 {old_handler}（{old_handler_role}）重置为报单人 {ticket['reporter']}（{ticket['reporter_role']}）"
+            f"报单人重新提交责任追踪单，责任归属重新判定，处理人从 {old_handler} 重置为报单人 {new_handler}（{new_handler_role}）"
         ]
         if req.description:
             detail_parts.append(f"补充描述: {req.description}")
@@ -4365,9 +4053,9 @@ def resubmit_liability_ticket(ticket_id: int, req: LiabilityResubmitRequest):
         "ok": True,
         "ticket_id": ticket_id,
         "status": "待处理",
-        "reporter": ticket["reporter"],
-        "current_handler": ticket["reporter"],
-        "current_handler_role": ticket["reporter_role"],
+        "reporter": new_handler,
+        "current_handler": new_handler,
+        "current_handler_role": new_handler_role,
     }
 
 
@@ -4452,16 +4140,11 @@ def transfer_liability_ticket(ticket_id: int, req: LiabilityTransferRequest):
             (req.target_handler, req.target_handler_role, now, ticket_id),
         )
 
-        conn.execute(
-            """
-            INSERT INTO liability_handler_transfers (
-                ticket_id, from_handler, from_handler_role, to_handler, to_handler_role,
-                transferred_by, transferred_role, transfer_reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (ticket_id, from_handler, from_handler_role,
-             req.target_handler, req.target_handler_role,
-             req.operator, req.role, req.transfer_reason, now),
+        log_handler_transfer(
+            conn, TicketType.LIABILITY, ticket_id,
+            from_handler, from_handler_role,
+            req.target_handler, req.target_handler_role,
+            req.operator, req.role, req.transfer_reason, now
         )
 
         _log_liability_audit(
@@ -4532,11 +4215,7 @@ def get_liability_audit(ticket_id: int):
         ticket = _get_liability_ticket(conn, ticket_id)
         if not ticket:
             raise HTTPException(404, f"代录责任追踪单 {ticket_id} 不存在")
-
-        rows = conn.execute(
-            "SELECT * FROM liability_audit_log WHERE ticket_id = ? ORDER BY id",
-            (ticket_id,),
-        ).fetchall()
+        rows = get_audit_log(conn, TicketType.LIABILITY, ticket_id)
     return [dict(r) for r in rows]
 
 
@@ -4597,103 +4276,14 @@ def get_batch_liability_summary(batch_no: str):
 def export_liability_json(status: str = None, batch_no: str = None, box_code: str = None,
                           reporter_role: str = None, current_handler_role: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM liability_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if reporter_role:
-            conditions.append("reporter_role = ?")
-            params.append(reporter_role)
+            extra_filters["reporter_role"] = reporter_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        result_rows = []
-        for t in tickets:
-            evidence = conn.execute(
-                "SELECT * FROM liability_evidence WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            transfers = conn.execute(
-                "SELECT * FROM liability_handler_transfers WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            audit = conn.execute(
-                "SELECT * FROM liability_audit_log WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-
-            responsibility_chain = []
-            responsibility_chain.append({
-                "handler": t["reporter"],
-                "handler_role": t["reporter_role"],
-                "action": "初始责任人（报单人）",
-                "at": t["created_at"],
-            })
-            for tr in transfers:
-                responsibility_chain.append({
-                    "from_handler": tr["from_handler"],
-                    "from_handler_role": tr["from_handler_role"],
-                    "to_handler": tr["to_handler"],
-                    "to_handler_role": tr["to_handler_role"],
-                    "transferred_by": tr["transferred_by"],
-                    "transferred_role": tr["transferred_role"],
-                    "transfer_reason": tr["transfer_reason"],
-                    "at": tr["created_at"],
-                })
-            responsibility_chain.append({
-                "handler": t["current_handler"],
-                "handler_role": t["current_handler_role"],
-                "action": "当前责任人",
-                "at": t["updated_at"],
-            })
-
-            result_rows.append({
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"],
-                "box_code": t["box_code"],
-                "reason_category": t["reason_category"],
-                "description": t["description"],
-                "status": t["status"],
-                "conclusion": t["conclusion"],
-                "allow_proxy_record_at_create": bool(t["allow_proxy_record_at_create"]),
-                "reporter": t["reporter"],
-                "reporter_role": t["reporter_role"],
-                "proxy_recorder": t["proxy_recorder"],
-                "proxy_recorder_role": t["proxy_recorder_role"],
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_at": t["withdrawn_at"],
-                "withdrawn_by": t["withdrawn_by"],
-                "withdrawn_reason": t["withdrawn_reason"],
-                "resubmitted_at": t["resubmitted_at"],
-                "resubmitted_by": t["resubmitted_by"],
-                "rejected_at": t["rejected_at"],
-                "rejected_by": t["rejected_by"],
-                "rejected_reason": t["rejected_reason"],
-                "closed_at": t["closed_at"],
-                "closed_by": t["closed_by"],
-                "closed_role": t["closed_role"],
-                "evidence_list": [dict(e) for e in evidence],
-                "transfer_history": [dict(tr) for tr in transfers],
-                "responsibility_chain": responsibility_chain,
-                "audit_log": [dict(a) for a in audit],
-            })
+            extra_filters["current_handler_role"] = current_handler_role
+        tickets = list_tickets(conn, TicketType.LIABILITY, status, batch_no, box_code,
+                               extra_filters=extra_filters)
+        result_rows = [build_export_json_row(conn, TicketType.LIABILITY, t) for t in tickets]
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -4706,96 +4296,19 @@ def export_liability_json(status: str = None, batch_no: str = None, box_code: st
 def export_liability_csv(status: str = None, batch_no: str = None, box_code: str = None,
                          reporter_role: str = None, current_handler_role: str = None):
     with get_db() as conn:
-        query = "SELECT * FROM liability_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if reporter_role:
-            conditions.append("reporter_role = ?")
-            params.append(reporter_role)
+            extra_filters["reporter_role"] = reporter_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        fields = [
-            "ticket_id", "ticket_no", "batch_no", "box_code",
-            "reason_category", "description", "status", "conclusion",
-            "reporter", "reporter_role",
-            "proxy_recorder", "proxy_recorder_role",
-            "current_handler", "current_handler_role",
-            "responsibility_transfers",
-            "created_at", "updated_at",
-            "withdrawn_by", "withdrawn_at", "withdrawn_reason",
-            "rejected_by", "rejected_at", "rejected_reason",
-            "closed_by", "closed_at", "closed_role",
-            "evidence_count",
-        ]
-
+            extra_filters["current_handler_role"] = current_handler_role
+        tickets = list_tickets(conn, TicketType.LIABILITY, status, batch_no, box_code,
+                               extra_filters=extra_filters)
+        fields = build_export_csv_fields(TicketType.LIABILITY)
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
-
         for t in tickets:
-            transfers = conn.execute(
-                "SELECT * FROM liability_handler_transfers WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            evidence = conn.execute(
-                "SELECT COUNT(*) as cnt FROM liability_evidence WHERE ticket_id = ?",
-                (t["id"],),
-            ).fetchone()
-
-            transfer_parts = []
-            transfer_parts.append(f"初始:{t['reporter']}({t['reporter_role']})[报单人]")
-            for tr in transfers:
-                transfer_parts.append(
-                    f"{tr['from_handler']}({tr['from_handler_role']})→{tr['to_handler']}({tr['to_handler_role']})"
-                    f"[{tr['transferred_by']}@{tr['created_at'][:19]}]"
-                )
-            transfer_parts.append(f"当前:{t['current_handler']}({t['current_handler_role']})")
-            transfer_str = " → ".join(transfer_parts)
-
-            row = {
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"] or "",
-                "box_code": t["box_code"] or "",
-                "reason_category": t["reason_category"],
-                "description": t["description"] or "",
-                "status": t["status"],
-                "conclusion": t["conclusion"] or "",
-                "reporter": t["reporter"],
-                "reporter_role": t["reporter_role"] or "",
-                "proxy_recorder": t["proxy_recorder"] or "",
-                "proxy_recorder_role": t["proxy_recorder_role"] or "",
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "responsibility_transfers": transfer_str,
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_by": t["withdrawn_by"] or "",
-                "withdrawn_at": t["withdrawn_at"] or "",
-                "withdrawn_reason": t["withdrawn_reason"] or "",
-                "rejected_by": t["rejected_by"] or "",
-                "rejected_at": t["rejected_at"] or "",
-                "rejected_reason": t["rejected_reason"] or "",
-                "closed_by": t["closed_by"] or "",
-                "closed_at": t["closed_at"] or "",
-                "closed_role": t["closed_role"] or "",
-                "evidence_count": evidence["cnt"],
-            }
+            row = build_export_csv_row(conn, TicketType.LIABILITY, t)
             writer.writerow(row)
 
     return StreamingResponse(
@@ -4838,14 +4351,9 @@ def _get_proxy_report_config(conn):
 
 def _log_proxy_report_audit(conn, ticket_id, action, from_status, to_status,
                             role, operator, reason, detail, created_at):
-    conn.execute(
-        """
-        INSERT INTO proxy_report_audit_log (ticket_id, action, from_status, to_status,
-                                            role, operator, reason, detail, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (ticket_id, action, from_status, to_status,
-         role, operator, reason, detail, created_at),
+    log_ticket_audit(
+        conn, TicketType.PROXY_REPORT, ticket_id, action, from_status, to_status,
+        role, operator, reason, detail, created_at
     )
 
 
@@ -4856,102 +4364,16 @@ def _get_proxy_report_ticket(conn, ticket_id):
 
 
 def _build_proxy_report_ticket_detail(conn, ticket):
-    evidence = conn.execute(
-        "SELECT * FROM proxy_report_evidence WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    assignments = conn.execute(
-        "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-    audit = conn.execute(
-        "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
-        (ticket["id"],),
-    ).fetchall()
-
-    responsibility_chain = []
-    responsibility_chain.append({
-        "handler": ticket["originator"],
-        "handler_role": ticket["responsibility_role"],
-        "action": "初始责任人（真实报单人）",
-        "at": ticket["created_at"],
-    })
-    for a in assignments:
-        responsibility_chain.append({
-            "from_handler": a["from_handler"],
-            "from_handler_role": a["from_handler_role"],
-            "to_handler": a["to_handler"],
-            "to_handler_role": a["to_handler_role"],
-            "assigned_by": a["assigned_by"],
-            "assigned_role": a["assigned_role"],
-            "assign_reason": a["assign_reason"],
-            "at": a["created_at"],
-        })
-    responsibility_chain.append({
-        "handler": ticket["current_handler"],
-        "handler_role": ticket["current_handler_role"],
-        "action": "当前责任人（卡住的岗位）",
-        "at": ticket["updated_at"],
-    })
-
-    return {
-        "id": ticket["id"],
-        "ticket_no": ticket["ticket_no"],
-        "batch_no": ticket["batch_no"],
-        "box_code": ticket["box_code"],
-        "reason_category": ticket["reason_category"],
-        "description": ticket["description"],
-        "status": ticket["status"],
-        "conclusion": ticket["conclusion"],
-        "allow_proxy_at_create": bool(ticket["allow_proxy_at_create"]),
-        "originator": ticket["originator"],
-        "originator_role": ticket["originator_role"],
-        "responsibility_role": ticket["responsibility_role"],
-        "proxy_recorder": ticket["proxy_recorder"],
-        "proxy_recorder_role": ticket["proxy_recorder_role"],
-        "current_handler": ticket["current_handler"],
-        "current_handler_role": ticket["current_handler_role"],
-        "created_at": ticket["created_at"],
-        "updated_at": ticket["updated_at"],
-        "withdrawn_at": ticket["withdrawn_at"],
-        "withdrawn_by": ticket["withdrawn_by"],
-        "withdrawn_reason": ticket["withdrawn_reason"],
-        "resubmitted_at": ticket["resubmitted_at"],
-        "resubmitted_by": ticket["resubmitted_by"],
-        "rejected_at": ticket["rejected_at"],
-        "rejected_by": ticket["rejected_by"],
-        "rejected_role": ticket["rejected_role"],
-        "rejected_reason": ticket["rejected_reason"],
-        "closed_at": ticket["closed_at"],
-        "closed_by": ticket["closed_by"],
-        "closed_role": ticket["closed_role"],
-        "evidence_list": [dict(e) for e in evidence],
-        "assignment_history": [dict(a) for a in assignments],
-        "audit_log": [dict(a) for a in audit],
-        "responsibility_chain": responsibility_chain,
-    }
+    detail = build_detail(conn, TicketType.PROXY_REPORT, ticket)
+    detail["audit_log"] = [dict(a) for a in get_audit_log(conn, TicketType.PROXY_REPORT, ticket["id"])]
+    detail["responsibility_role"] = ticket["responsibility_role"]
+    return detail
 
 
 def _check_duplicate_proxy_report(conn, batch_no, box_code, reason_category, exclude_ticket_id=None):
-    query = """
-        SELECT * FROM proxy_report_tickets
-        WHERE reason_category = ? AND status IN ('待指派', '处理中')
-    """
-    params = [reason_category]
-    if batch_no:
-        query += " AND batch_no = ?"
-        params.append(batch_no)
-    else:
-        query += " AND batch_no IS NULL"
-    if box_code:
-        query += " AND box_code = ?"
-        params.append(box_code)
-    else:
-        query += " AND box_code IS NULL"
-    if exclude_ticket_id is not None:
-        query += " AND id != ?"
-        params.append(exclude_ticket_id)
-    return conn.execute(query, params).fetchone()
+    return check_duplicate_ticket(
+        conn, TicketType.PROXY_REPORT, box_code, reason_category, exclude_ticket_id
+    )
 
 
 @app.get("/api/proxy_report/config")
@@ -5036,26 +4458,21 @@ def create_proxy_report_ticket(data: ProxyReportTicketCreate):
 
         dup = _check_duplicate_proxy_report(conn, data.batch_no, data.box_code, data.reason_category)
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同箱号/批次+原因分类的未关闭受理单（工单号: {dup['ticket_no']}），请勿重复建单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.PROXY_REPORT, dup))
 
-        if is_proxy:
-            originator = data.on_behalf_of
-            originator_role = data.on_behalf_of_role
-            responsibility_role = data.on_behalf_of_role
-            proxy_recorder = data.operator
-            proxy_recorder_role = data.role
-        else:
-            originator = data.operator
-            originator_role = data.role
-            responsibility_role = data.role
-            proxy_recorder = None
-            proxy_recorder_role = None
-
-        current_handler = originator
-        current_handler_role = responsibility_role
+        resp = compute_responsibility(
+            TicketType.PROXY_REPORT, data.operator, data.role,
+            data.on_behalf_of if is_proxy else None,
+            data.on_behalf_of_role if is_proxy else None
+        )
+        originator = resp["originator"]
+        originator_role = resp["originator_role"]
+        responsibility_role = resp["responsibility_role"]
+        proxy_recorder = resp["proxy_recorder"]
+        proxy_recorder_role = resp["proxy_recorder_role"]
+        current_handler = resp["current_handler"]
+        current_handler_role = resp["current_handler_role"]
+        is_proxy = resp["is_proxy"]
 
         now = datetime.now().isoformat()
         ticket_no = f"PR-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
@@ -5129,34 +4546,17 @@ def list_proxy_report_tickets(
     current_handler: str = None,
 ):
     with get_db() as conn:
-        query = "SELECT * FROM proxy_report_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if responsibility_role:
-            conditions.append("responsibility_role = ?")
-            params.append(responsibility_role)
+            extra_filters["responsibility_role"] = responsibility_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
+            extra_filters["current_handler_role"] = current_handler_role
         if originator:
-            conditions.append("originator = ?")
-            params.append(originator)
+            extra_filters["originator"] = originator
         if current_handler:
-            conditions.append("current_handler = ?")
-            params.append(current_handler)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        rows = conn.execute(query, params).fetchall()
+            extra_filters["current_handler"] = current_handler
+        rows = list_tickets(conn, TicketType.PROXY_REPORT, status, batch_no, box_code,
+                            extra_filters=extra_filters)
     return [dict(r) for r in rows]
 
 
@@ -5206,16 +4606,11 @@ def assign_proxy_report_ticket(ticket_id: int, req: ProxyReportAssignRequest):
             (req.target_handler, req.target_handler_role, target_status, now, ticket_id),
         )
 
-        conn.execute(
-            """
-            INSERT INTO proxy_report_assignments (
-                ticket_id, from_handler, from_handler_role, to_handler, to_handler_role,
-                assigned_by, assigned_role, assign_reason, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (ticket_id, from_handler, from_handler_role,
-             req.target_handler, req.target_handler_role,
-             req.operator, req.role, req.assign_reason, now),
+        log_handler_transfer(
+            conn, TicketType.PROXY_REPORT, ticket_id,
+            from_handler, from_handler_role,
+            req.target_handler, req.target_handler_role,
+            req.operator, req.role, req.assign_reason, now
         )
 
         _log_proxy_report_audit(
@@ -5318,17 +4713,16 @@ def resubmit_proxy_report_ticket(ticket_id: int, req: ProxyReportResubmitRequest
             exclude_ticket_id=ticket_id
         )
         if dup:
-            raise HTTPException(
-                409,
-                f"已存在相同箱号/批次+原因分类的未关闭受理单（工单号: {dup['ticket_no']}），请勿重复建单"
-            )
+            raise HTTPException(409, get_duplicate_error_msg(TicketType.PROXY_REPORT, dup))
 
         now = datetime.now().isoformat()
 
+        handler_reset = recompute_responsibility_on_resubmit(TicketType.PROXY_REPORT, ticket)
+        current_handler = handler_reset["current_handler"]
+        current_handler_role = handler_reset["current_handler_role"]
         originator = ticket["originator"]
         responsibility_role = ticket["responsibility_role"]
-        current_handler = originator
-        current_handler_role = responsibility_role
+        old_handler = ticket["current_handler"]
 
         update_fields = [
             "status = '待指派'", "updated_at = ?",
@@ -5355,8 +4749,8 @@ def resubmit_proxy_report_ticket(ticket_id: int, req: ProxyReportResubmitRequest
         )
 
         detail_parts = [
-            f"真实报单人重新上报，按真实报单人 {originator}（{responsibility_role}）"
-            f"重新计算责任归属，当前处理人重置为发起人（不沿用代填人或上一位处理人）"
+            f"真实报单人重新上报，处理人从 {old_handler} 重置为发起人 {originator}（{responsibility_role}）"
+            f"，责任归属重新计算（不沿用代填人或上一位处理人）"
         ]
         if req.description:
             detail_parts.append(f"补充描述: {req.description}")
@@ -5480,11 +4874,7 @@ def get_proxy_report_audit(ticket_id: int):
         ticket = _get_proxy_report_ticket(conn, ticket_id)
         if not ticket:
             raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
-
-        rows = conn.execute(
-            "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
-            (ticket_id,),
-        ).fetchall()
+        rows = get_audit_log(conn, TicketType.PROXY_REPORT, ticket_id)
     return [dict(r) for r in rows]
 
 
@@ -5555,104 +4945,16 @@ def export_proxy_report_json(
     current_handler_role: str = None,
 ):
     with get_db() as conn:
-        query = "SELECT * FROM proxy_report_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if responsibility_role:
-            conditions.append("responsibility_role = ?")
-            params.append(responsibility_role)
+            extra_filters["responsibility_role"] = responsibility_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        result_rows = []
-        for t in tickets:
-            evidence = conn.execute(
-                "SELECT * FROM proxy_report_evidence WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            assignments = conn.execute(
-                "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            audit = conn.execute(
-                "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-
-            responsibility_chain = []
-            responsibility_chain.append({
-                "handler": t["originator"],
-                "handler_role": t["responsibility_role"],
-                "action": "初始责任人（真实报单人）",
-                "at": t["created_at"],
-            })
-            for a in assignments:
-                responsibility_chain.append({
-                    "from_handler": a["from_handler"],
-                    "from_handler_role": a["from_handler_role"],
-                    "to_handler": a["to_handler"],
-                    "to_handler_role": a["to_handler_role"],
-                    "assigned_by": a["assigned_by"],
-                    "assigned_role": a["assigned_role"],
-                    "assign_reason": a["assign_reason"],
-                    "at": a["created_at"],
-                })
-            responsibility_chain.append({
-                "handler": t["current_handler"],
-                "handler_role": t["current_handler_role"],
-                "action": "当前责任人（卡住的岗位）",
-                "at": t["updated_at"],
-            })
-
-            result_rows.append({
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"],
-                "box_code": t["box_code"],
-                "reason_category": t["reason_category"],
-                "description": t["description"],
-                "status": t["status"],
-                "conclusion": t["conclusion"],
-                "allow_proxy_at_create": bool(t["allow_proxy_at_create"]),
-                "originator": t["originator"],
-                "originator_role": t["originator_role"],
-                "responsibility_role": t["responsibility_role"],
-                "proxy_recorder": t["proxy_recorder"],
-                "proxy_recorder_role": t["proxy_recorder_role"],
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_at": t["withdrawn_at"],
-                "withdrawn_by": t["withdrawn_by"],
-                "withdrawn_reason": t["withdrawn_reason"],
-                "resubmitted_at": t["resubmitted_at"],
-                "resubmitted_by": t["resubmitted_by"],
-                "rejected_at": t["rejected_at"],
-                "rejected_by": t["rejected_by"],
-                "rejected_reason": t["rejected_reason"],
-                "closed_at": t["closed_at"],
-                "closed_by": t["closed_by"],
-                "closed_role": t["closed_role"],
-                "evidence_list": [dict(e) for e in evidence],
-                "assignment_history": [dict(a) for a in assignments],
-                "responsibility_chain": responsibility_chain,
-                "audit_log": [dict(a) for a in audit],
-            })
+            extra_filters["current_handler_role"] = current_handler_role
+        tickets = list_tickets(conn, TicketType.PROXY_REPORT, status, batch_no, box_code,
+                               extra_filters=extra_filters)
+        result_rows = [build_export_json_row(conn, TicketType.PROXY_REPORT, t) for t in tickets]
+        for r, t in zip(result_rows, tickets):
+            r["responsibility_role"] = t["responsibility_role"]
 
     return {
         "generated_at": datetime.now().isoformat(),
@@ -5670,100 +4972,21 @@ def export_proxy_report_csv(
     current_handler_role: str = None,
 ):
     with get_db() as conn:
-        query = "SELECT * FROM proxy_report_tickets"
-        conditions = []
-        params = []
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-        if batch_no:
-            conditions.append("batch_no = ?")
-            params.append(batch_no)
-        if box_code:
-            conditions.append("box_code = ?")
-            params.append(box_code)
+        extra_filters = {}
         if responsibility_role:
-            conditions.append("responsibility_role = ?")
-            params.append(responsibility_role)
+            extra_filters["responsibility_role"] = responsibility_role
         if current_handler_role:
-            conditions.append("current_handler_role = ?")
-            params.append(current_handler_role)
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-        query += " ORDER BY created_at DESC"
-        tickets = conn.execute(query, params).fetchall()
-
-        fields = [
-            "ticket_id", "ticket_no", "batch_no", "box_code",
-            "reason_category", "description", "status", "conclusion",
-            "originator", "originator_role",
-            "responsibility_role",
-            "proxy_recorder", "proxy_recorder_role",
-            "current_handler", "current_handler_role",
-            "responsibility_chain_text",
-            "allow_proxy_at_create",
-            "created_at", "updated_at",
-            "withdrawn_by", "withdrawn_at", "withdrawn_reason",
-            "resubmitted_by", "resubmitted_at",
-            "closed_by", "closed_at", "closed_role",
-            "evidence_count",
-        ]
-
+            extra_filters["current_handler_role"] = current_handler_role
+        tickets = list_tickets(conn, TicketType.PROXY_REPORT, status, batch_no, box_code,
+                               extra_filters=extra_filters)
+        fields = build_export_csv_fields(TicketType.PROXY_REPORT)
+        fields.insert(fields.index("originator_role") + 1, "responsibility_role")
         output = io.StringIO()
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
-
         for t in tickets:
-            assignments = conn.execute(
-                "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
-                (t["id"],),
-            ).fetchall()
-            evidence = conn.execute(
-                "SELECT COUNT(*) as cnt FROM proxy_report_evidence WHERE ticket_id = ?",
-                (t["id"],),
-            ).fetchone()
-
-            chain_parts = []
-            chain_parts.append(f"[发起]{t['originator']}({t['responsibility_role']})")
-            for a in assignments:
-                chain_parts.append(
-                    f"[指派]{a['from_handler']}({a['from_handler_role']})"
-                    f"→{a['to_handler']}({a['to_handler_role']})"
-                    f"[{a['assigned_by']}@{a['created_at'][:19]}]"
-                )
-            chain_parts.append(f"[当前卡住]{t['current_handler']}({t['current_handler_role']})")
-            chain_str = " → ".join(chain_parts)
-
-            row = {
-                "ticket_id": t["id"],
-                "ticket_no": t["ticket_no"],
-                "batch_no": t["batch_no"] or "",
-                "box_code": t["box_code"] or "",
-                "reason_category": t["reason_category"],
-                "description": t["description"] or "",
-                "status": t["status"],
-                "conclusion": t["conclusion"] or "",
-                "originator": t["originator"],
-                "originator_role": t["originator_role"] or "",
-                "responsibility_role": t["responsibility_role"],
-                "proxy_recorder": t["proxy_recorder"] or "",
-                "proxy_recorder_role": t["proxy_recorder_role"] or "",
-                "current_handler": t["current_handler"],
-                "current_handler_role": t["current_handler_role"],
-                "responsibility_chain_text": chain_str,
-                "allow_proxy_at_create": bool(t["allow_proxy_at_create"]),
-                "created_at": t["created_at"],
-                "updated_at": t["updated_at"],
-                "withdrawn_by": t["withdrawn_by"] or "",
-                "withdrawn_at": t["withdrawn_at"] or "",
-                "withdrawn_reason": t["withdrawn_reason"] or "",
-                "resubmitted_by": t["resubmitted_by"] or "",
-                "resubmitted_at": t["resubmitted_at"] or "",
-                "closed_by": t["closed_by"] or "",
-                "closed_at": t["closed_at"] or "",
-                "closed_role": t["closed_role"] or "",
-                "evidence_count": evidence["cnt"],
-            }
+            row = build_export_csv_row(conn, TicketType.PROXY_REPORT, t)
+            row["responsibility_role"] = t["responsibility_role"]
             writer.writerow(row)
 
     return StreamingResponse(
