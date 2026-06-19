@@ -77,7 +77,10 @@ def init_db():
                 missing_boxes INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                created_by TEXT
+                created_by TEXT,
+                review_status TEXT NOT NULL DEFAULT '未开始',
+                archived_at TEXT,
+                archived_by TEXT
             )
             """
         )
@@ -116,6 +119,57 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                require_double_review INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '进行中',
+                require_double_review INTEGER NOT NULL DEFAULT 0,
+                initiated_by TEXT NOT NULL,
+                initiated_role TEXT NOT NULL,
+                initiated_at TEXT NOT NULL,
+                handed_over_by TEXT,
+                cancelled_at TEXT,
+                cancelled_by TEXT,
+                cancelled_reason TEXT,
+                completed_at TEXT,
+                UNIQUE(batch_no, status)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_review_boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL,
+                box_code TEXT NOT NULL,
+                first_review_result TEXT,
+                first_reviewer TEXT,
+                first_review_role TEXT,
+                first_review_reason TEXT,
+                first_review_at TEXT,
+                second_review_result TEXT,
+                second_reviewer TEXT,
+                second_review_role TEXT,
+                second_review_reason TEXT,
+                second_review_at TEXT,
+                final_result TEXT,
+                UNIQUE(review_id, box_code),
+                FOREIGN KEY (review_id) REFERENCES batch_reviews(id)
+            )
+            """
+        )
         _migrate_db(conn)
 
 
@@ -138,5 +192,77 @@ def _migrate_db(conn):
         pass
     try:
         conn.execute("ALTER TABLE batch_boxes ADD COLUMN missing_cancel_reason TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batches ADD COLUMN review_status TEXT NOT NULL DEFAULT '未开始'")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batches ADD COLUMN archived_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batches ADD COLUMN archived_by TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS review_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                require_double_review INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_no TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '进行中',
+                require_double_review INTEGER NOT NULL DEFAULT 0,
+                initiated_by TEXT NOT NULL,
+                initiated_role TEXT NOT NULL,
+                initiated_at TEXT NOT NULL,
+                handed_over_by TEXT,
+                cancelled_at TEXT,
+                cancelled_by TEXT,
+                cancelled_reason TEXT,
+                completed_at TEXT,
+                UNIQUE(batch_no, status)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS batch_review_boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                review_id INTEGER NOT NULL,
+                box_code TEXT NOT NULL,
+                first_review_result TEXT,
+                first_reviewer TEXT,
+                first_review_role TEXT,
+                first_review_reason TEXT,
+                first_review_at TEXT,
+                second_review_result TEXT,
+                second_reviewer TEXT,
+                second_review_role TEXT,
+                second_review_reason TEXT,
+                second_review_at TEXT,
+                final_result TEXT,
+                UNIQUE(review_id, box_code),
+                FOREIGN KEY (review_id) REFERENCES batch_reviews(id)
+            )
+            """
+        )
     except sqlite3.OperationalError:
         pass

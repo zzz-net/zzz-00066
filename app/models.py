@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
 
 class ThresholdCreate(BaseModel):
@@ -80,6 +80,9 @@ class BatchOut(BaseModel):
     created_at: str
     updated_at: str
     created_by: Optional[str] = None
+    review_status: Optional[str] = None
+    archived_at: Optional[str] = None
+    archived_by: Optional[str] = None
 
 
 class BatchBoxOut(BaseModel):
@@ -144,3 +147,52 @@ class BatchAuditOut(BaseModel):
     reason: Optional[str] = None
     detail: Optional[str] = None
     created_at: str
+
+
+class ReviewConfigUpdate(BaseModel):
+    require_double_review: bool
+    operator: str
+
+
+class ReviewInitiateRequest(BaseModel):
+    role: str
+    operator: str
+    handed_over_by: Optional[str] = None
+
+
+class ReviewBoxResult(BaseModel):
+    box_code: str
+    result: str
+    reason: Optional[str] = None
+
+
+class ReviewBoxRequest(BaseModel):
+    role: str
+    operator: str
+    reviews: List[ReviewBoxResult]
+
+
+class ReviewCancelRequest(BaseModel):
+    role: str
+    operator: str
+    reason: str
+
+
+class ArchiveRequest(BaseModel):
+    role: str
+    operator: str
+
+
+class ReviewBoxDetail(BaseModel):
+    box_code: str
+    first_review_result: Optional[str] = None
+    first_reviewer: Optional[str] = None
+    first_review_role: Optional[str] = None
+    first_review_reason: Optional[str] = None
+    first_review_at: Optional[str] = None
+    second_review_result: Optional[str] = None
+    second_reviewer: Optional[str] = None
+    second_review_role: Optional[str] = None
+    second_review_reason: Optional[str] = None
+    second_review_at: Optional[str] = None
+    final_result: Optional[str] = None

@@ -187,14 +187,14 @@ def main():
                 and "R005" in data["pending_todos"]))
 
     print()
-    print("  1.5 最后1箱R005签收，R004仍缺失")
+    print("  1.5 最后1箱R005签收，R004仍缺失（所有箱子处理完 → 已签收）")
     status, data = api("POST", "/api/batches/BATCH-REG-001/receive", {
         "role": "库房签收员",
         "operator": "王五",
         "received_boxes": ["R005"],
     })
-    test("签收R005 → 仍部分签收（有缺失）", status,
-         check=data.get("to") == "部分签收")
+    test("签收R005 → 已签收（所有箱子要么签收要么缺失）", status,
+         check=data.get("to") == "已签收")
 
     status, data = api("GET", "/api/batches/BATCH-REG-001")
     test("验证：已签收4箱，缺失1箱，无待办", status,
@@ -214,7 +214,7 @@ def main():
         "reason": "箱子在仓库角落找到",
         "box_codes": ["R004"],
     })
-    test("管理员撤销R004缺失登记", status,
+    test("管理员撤销R004缺失登记 → 状态回退到部分签收（R004变待签收）", status,
          check=data.get("ok") and data.get("batch_status") == "部分签收")
 
     status, data = api("POST", "/api/batches/BATCH-REG-001/receive", {
@@ -265,7 +265,7 @@ def main():
     })
 
     print()
-    print("  2.2 签收3箱，登记1箱缺失 → 部分签收")
+    print("  2.2 签收3箱，登记1箱缺失 → 已签收（所有箱子都处理完）")
     status, data = api("POST", "/api/batches/BATCH-REG-002/receive", {
         "role": "库房签收员",
         "operator": "王五",
@@ -273,23 +273,24 @@ def main():
         "missing_boxes": ["S004"],
         "missing_reason": "未找到",
     })
-    test("签收3箱+缺失1箱", status,
-         check=data.get("to") == "部分签收" and data.get("received_count") == 3)
+    test("签收3箱+缺失1箱 → 已签收", status,
+         check=data.get("to") == "已签收" and data.get("received_count") == 3)
 
     status, data = api("GET", "/api/batches/BATCH-REG-002")
     test("验证：已签收3箱，缺失1箱", status,
          check=(data["batch"]["received_boxes"] == 3
-                and data["batch"]["missing_boxes"] == 1))
+                and data["batch"]["missing_boxes"] == 1
+                and data["batch"]["status"] == "已签收"))
 
     print()
-    print("  2.3 撤销缺失登记，验证已签收状态不回退")
+    print("  2.3 撤销缺失登记，状态从已签收回退到部分签收（有箱子变待签收）")
     status, data = api("POST", "/api/batches/BATCH-REG-002/cancel_missing", {
         "role": "管理员",
         "operator": "管理员A",
         "reason": "箱子找到",
         "box_codes": ["S004"],
     })
-    test("撤销缺失登记", status,
+    test("撤销缺失登记 → 状态回退到部分签收", status,
          check=data.get("ok") and data.get("batch_status") == "部分签收")
 
     status, data = api("GET", "/api/batches/BATCH-REG-002")

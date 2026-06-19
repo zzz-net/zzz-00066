@@ -16,6 +16,11 @@ from app.models import (
     MissingBoxRegisterRequest,
     MissingBoxCancelRequest,
     BatchTransitionRequest,
+    ReviewConfigUpdate,
+    ReviewInitiateRequest,
+    ReviewBoxRequest,
+    ReviewCancelRequest,
+    ArchiveRequest,
 )
 
 app = FastAPI(title="冷链交接 API")
@@ -88,7 +93,10 @@ BATCH_TRANSITIONS = {
     },
 }
 
-BATCH_TERMINAL_STATES = {"已签收", "已回退"}
+BATCH_TERMINAL_STATES = {"已回退", "已归档"}
+BATCH_LOCKED_AFTER_RECEIVE = {"已签收"}
+
+VALID_REVIEW_RESULTS = {"通过", "破损", "温控待确认"}
 
 
 @app.on_event("startup")
@@ -199,10 +207,10 @@ def _import_boxes(items: list[BoxImportItem], batch_no: str = None,
             ).fetchone()
             if batch_info:
                 batch_sample_type = batch_info["sample_type"]
-                if batch_info["status"] in BATCH_TERMINAL_STATES:
+                if batch_info["status"] in BATCH_TERMINAL_STATES or batch_info["status"] in BATCH_LOCKED_AFTER_RECEIVE:
                     raise HTTPException(
                         409,
-                        f"批次 {batch_no} 当前状态「{batch_info['status']}」为终态，不可新增箱子",
+                        f"批次 {batch_no} 当前状态「{batch_info['status']}」已完成签收，不可新增箱子",
                     )
 
         for item in items:
@@ -354,6 +362,105 @@ def _action_label(action: str) -> str:
         "recover": "恢复",
     }
     return labels.get(action, action)
+
+
+def _get_review_config(conn):
+    row = conn.execute("SELECT * FROM review_config WHERE id = 1").fetchone()
+    if not row:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO review_config (id, require_double_review, updated_at, updated_by) VALUES (1, 0, ?, '系统初始化')",
+            (now,),
+        )
+        row = conn.execute("SELECT * FROM review_config WHERE id = 1").fetchone()
+    return row
+
+
+def _get_active_review(conn, batch_no):
+    return conn.execute(
+        "SELECT * FROM batch_reviews WHERE batch_no = ? AND status = '进行中'",
+        (batch_no,),
+    ).fetchone()
+
+
+def _compute_review_progress(conn, review_id, require_double_review):
+    boxes = conn.execute(
+        "SELECT * FROM batch_review_boxes WHERE review_id = ?",
+        (review_id,),
+    ).fetchall()
+    total = len(boxes)
+    first_done = 0
+    second_done = 0
+    final_done = 0
+    pending_first = []
+    pending_second = []
+    pending_temp_confirm = []
+
+    for b in boxes:
+        if b["first_review_result"]:
+            first_done += 1
+        else:
+            pending_first.append(b["box_code"])
+
+        if require_double_review:
+            if b["second_review_result"]:
+                second_done += 1
+            elif b["first_review_result"]:
+                pending_second.append(b["box_code"])
+            if b["final_result"] and b["final_result"] != "温控待确认":
+                final_done += 1
+            if b["final_result"] == "温控待确认" or b["first_review_result"] == "温控待确认" or b["second_review_result"] == "温控待确认":
+                pending_temp_confirm.append(b["box_code"])
+        else:
+            if b["first_review_result"] and b["first_review_result"] != "温控待确认":
+                final_done += 1
+            if b["first_review_result"] == "温控待确认":
+                pending_temp_confirm.append(b["box_code"])
+
+    all_done = False
+    if require_double_review:
+        all_done = (second_done == total) and (len(pending_temp_confirm) == 0)
+    else:
+        all_done = (first_done == total) and (len(pending_temp_confirm) == 0)
+
+    return {
+        "total_boxes": total,
+        "first_review_done": first_done,
+        "second_review_done": second_done,
+        "final_review_done": final_done,
+        "pending_first_review": pending_first,
+        "pending_second_review": pending_second,
+        "pending_temp_confirmation": pending_temp_confirm,
+        "all_reviewed": all_done,
+    }
+
+
+def _check_review_conflict_on_receive(conn, batch_no):
+    active = _get_active_review(conn, batch_no)
+    if active:
+        snapshot_boxes = {
+            r["box_code"] for r in conn.execute(
+                "SELECT box_code FROM batch_review_boxes WHERE review_id = ?",
+                (active["id"],),
+            ).fetchall()
+        }
+        current_received = {
+            r["box_code"] for r in conn.execute(
+                """
+                SELECT bb.box_code FROM batch_boxes bb
+                JOIN boxes b ON bb.box_code = b.box_code
+                WHERE bb.batch_no = ? AND b.status = '已签收'
+                """,
+                (batch_no,),
+            ).fetchall()
+        }
+        new_boxes = current_received - snapshot_boxes
+        if new_boxes:
+            raise HTTPException(
+                409,
+                f"批次 {batch_no} 正在复核中，复核启动后新签收了 {len(new_boxes)} 箱: {', '.join(sorted(new_boxes))}。"
+                f"请先撤销当前复核再重新发起。"
+            )
 
 
 # ── Box Queries ──────────────────────────────────────────────────────────────
@@ -666,11 +773,56 @@ def get_batch(batch_no: str):
             if r["status"] not in TERMINAL_STATES and r["box_batch_status"] != "缺失"
         ]
 
-    return {
-        "batch": dict(batch),
-        "boxes": [dict(r) for r in boxes],
-        "pending_todos": pending,
-    }
+        result = {
+            "batch": dict(batch),
+            "boxes": [dict(r) for r in boxes],
+            "pending_todos": pending,
+        }
+
+        active_review = _get_active_review(conn, batch_no)
+        if active_review:
+            review_boxes = conn.execute(
+                "SELECT * FROM batch_review_boxes WHERE review_id = ? ORDER BY id",
+                (active_review["id"],),
+            ).fetchall()
+            progress = _compute_review_progress(
+                conn, active_review["id"], bool(active_review["require_double_review"])
+            )
+            result["review"] = {
+                "review_id": active_review["id"],
+                "status": active_review["status"],
+                "require_double_review": bool(active_review["require_double_review"]),
+                "initiated_by": active_review["initiated_by"],
+                "initiated_at": active_review["initiated_at"],
+                "handed_over_by": active_review["handed_over_by"],
+                "boxes": [dict(r) for r in review_boxes],
+                "progress": progress,
+            }
+        else:
+            last_review = conn.execute(
+                "SELECT * FROM batch_reviews WHERE batch_no = ? ORDER BY id DESC LIMIT 1",
+                (batch_no,),
+            ).fetchone()
+            if last_review:
+                review_boxes = conn.execute(
+                    "SELECT * FROM batch_review_boxes WHERE review_id = ? ORDER BY id",
+                    (last_review["id"],),
+                ).fetchall()
+                result["review"] = {
+                    "review_id": last_review["id"],
+                    "status": last_review["status"],
+                    "require_double_review": bool(last_review["require_double_review"]),
+                    "initiated_by": last_review["initiated_by"],
+                    "initiated_at": last_review["initiated_at"],
+                    "handed_over_by": last_review["handed_over_by"],
+                    "cancelled_at": last_review["cancelled_at"],
+                    "cancelled_by": last_review["cancelled_by"],
+                    "cancelled_reason": last_review["cancelled_reason"],
+                    "completed_at": last_review["completed_at"],
+                    "boxes": [dict(r) for r in review_boxes],
+                }
+
+    return result
 
 
 @app.post("/api/batches/{batch_no}/dispatch")
@@ -712,6 +864,12 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
         if current_status in BATCH_TERMINAL_STATES:
             raise HTTPException(
                 409, f"批次 {batch_no} 当前状态「{current_status}」为终态，不可变更"
+            )
+
+        if current_status in BATCH_LOCKED_AFTER_RECEIVE and action != "receive":
+            raise HTTPException(
+                409,
+                f"批次 {batch_no} 当前状态「{current_status}」已签收，仅允许签收（补签）操作"
             )
 
         if current_status not in rule["from"]:
@@ -838,8 +996,11 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
             has_missing = stats["missing_cnt"] > 0
             all_received = stats["received_cnt"] >= stats["total"]
             has_partial = stats["received_cnt"] > 0 and not all_received
+            all_handled = (stats["received_cnt"] + stats["missing_cnt"]) >= stats["total"] and stats["total"] > 0
 
             if all_received and not has_missing:
+                batch_target = "已签收"
+            elif all_handled:
                 batch_target = "已签收"
             elif has_partial or has_missing:
                 batch_target = "部分签收"
@@ -890,10 +1051,10 @@ def receive_batch(batch_no: str, req: BatchReceiveRequest):
             raise HTTPException(
                 409, f"批次 {batch_no} 当前状态「{current_status}」为终态，不可变更"
             )
-        if current_status not in ("待签收", "部分签收"):
+        if current_status not in ("待签收", "部分签收", "已签收"):
             raise HTTPException(
                 409,
-                f"批次当前状态「{current_status}」不允许签收（允许的状态: 待签收, 部分签收）",
+                f"批次当前状态「{current_status}」不允许签收（允许的状态: 待签收, 部分签收, 已签收）",
             )
 
         if req.role != "库房签收员":
@@ -1017,8 +1178,11 @@ def receive_batch(batch_no: str, req: BatchReceiveRequest):
 
         all_received = stats["received_cnt"] >= stats["total"]
         has_missing = stats["missing_cnt"] > 0
+        all_handled = (stats["received_cnt"] + stats["missing_cnt"]) >= stats["total"] and stats["total"] > 0
 
         if all_received and not has_missing:
+            batch_target = "已签收"
+        elif all_handled:
             batch_target = "已签收"
         elif has_missing or stats["received_cnt"] > 0:
             batch_target = "部分签收"
@@ -1202,9 +1366,12 @@ def cancel_missing_boxes(batch_no: str, req: MissingBoxCancelRequest):
         has_missing = stats["missing_cnt"] > 0
         all_received = stats["received_cnt"] >= stats["total"]
         has_partial = stats["received_cnt"] > 0 and not all_received
+        all_handled = (stats["received_cnt"] + stats["missing_cnt"]) >= stats["total"] and stats["total"] > 0
 
         batch_target = batch["status"]
         if not has_missing and all_received:
+            batch_target = "已签收"
+        elif all_handled:
             batch_target = "已签收"
         elif not has_missing and has_partial:
             batch_target = "部分签收"
@@ -1341,7 +1508,504 @@ def export_json(batch_no: str = None):
                     "created_at": batch["created_at"],
                     "updated_at": batch["updated_at"],
                     "created_by": batch["created_by"],
+                    "review_status": batch["review_status"],
+                    "archived_at": batch["archived_at"],
+                    "archived_by": batch["archived_by"],
                 }
                 result["batch_boxes"] = [dict(r) for r in boxes]
                 result["batch_audit_log"] = [dict(r) for r in batch_audit]
+
+                review = conn.execute(
+                    "SELECT * FROM batch_reviews WHERE batch_no = ? AND status = '进行中'",
+                    (batch_no,),
+                ).fetchone()
+                if review:
+                    review_boxes = conn.execute(
+                        "SELECT * FROM batch_review_boxes WHERE review_id = ?",
+                        (review["id"],),
+                    ).fetchall()
+                    result["current_review"] = {
+                        "review_id": review["id"],
+                        "status": review["status"],
+                        "require_double_review": bool(review["require_double_review"]),
+                        "initiated_by": review["initiated_by"],
+                        "initiated_role": review["initiated_role"],
+                        "initiated_at": review["initiated_at"],
+                        "handed_over_by": review["handed_over_by"],
+                        "boxes": [dict(r) for r in review_boxes],
+                    }
+                else:
+                    last_review = conn.execute(
+                        "SELECT * FROM batch_reviews WHERE batch_no = ? ORDER BY id DESC LIMIT 1",
+                        (batch_no,),
+                    ).fetchone()
+                    if last_review:
+                        review_boxes = conn.execute(
+                            "SELECT * FROM batch_review_boxes WHERE review_id = ?",
+                            (last_review["id"],),
+                        ).fetchall()
+                        result["current_review"] = {
+                            "review_id": last_review["id"],
+                            "status": last_review["status"],
+                            "require_double_review": bool(last_review["require_double_review"]),
+                            "initiated_by": last_review["initiated_by"],
+                            "initiated_role": last_review["initiated_role"],
+                            "initiated_at": last_review["initiated_at"],
+                            "handed_over_by": last_review["handed_over_by"],
+                            "cancelled_at": last_review["cancelled_at"],
+                            "cancelled_by": last_review["cancelled_by"],
+                            "cancelled_reason": last_review["cancelled_reason"],
+                            "completed_at": last_review["completed_at"],
+                            "boxes": [dict(r) for r in review_boxes],
+                        }
     return result
+
+
+# ── Review Configuration API ─────────────────────────────────────────────────
+
+
+@app.get("/api/review/config")
+def get_review_config():
+    with get_db() as conn:
+        cfg = _get_review_config(conn)
+    return {
+        "require_double_review": bool(cfg["require_double_review"]),
+        "updated_at": cfg["updated_at"],
+        "updated_by": cfg["updated_by"],
+    }
+
+
+@app.post("/api/review/config")
+def update_review_config(data: ReviewConfigUpdate):
+    with get_db() as conn:
+        _get_review_config(conn)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE review_config SET require_double_review = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+            (1 if data.require_double_review else 0, now, data.operator),
+        )
+    return {
+        "ok": True,
+        "require_double_review": data.require_double_review,
+    }
+
+
+# ── Review APIs ───────────────────────────────────────────────────────────────
+
+
+@app.post("/api/batches/{batch_no}/review/initiate")
+def initiate_review(batch_no: str, req: ReviewInitiateRequest):
+    if req.role != "仓库主管":
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权发起交接复核，允许角色: ['仓库主管']",
+        )
+
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        if batch["status"] == "已归档":
+            raise HTTPException(409, f"批次 {batch_no} 已归档，不可再发起复核")
+
+        if batch["status"] != "已签收":
+            raise HTTPException(
+                409,
+                f"批次当前状态「{batch['status']}」不允许发起交接复核，必须在「已签收」后发起"
+            )
+
+        active = _get_active_review(conn, batch_no)
+        if active:
+            raise HTTPException(
+                409,
+                f"批次 {batch_no} 已有进行中的复核（ID: {active['id']}），请先撤销或完成后再发起"
+            )
+
+        cfg = _get_review_config(conn)
+        require_double = bool(cfg["require_double_review"])
+
+        batch_boxes = conn.execute(
+            """
+            SELECT bb.box_code FROM batch_boxes bb
+            JOIN boxes b ON bb.box_code = b.box_code
+            WHERE bb.batch_no = ? AND b.status = '已签收'
+            ORDER BY bb.id
+            """,
+            (batch_no,),
+        ).fetchall()
+
+        if not batch_boxes:
+            raise HTTPException(400, f"批次 {batch_no} 没有已签收的箱子，无法发起复核")
+
+        now = datetime.now().isoformat()
+
+        cur = conn.execute(
+            """
+            INSERT INTO batch_reviews (batch_no, status, require_double_review,
+                                       initiated_by, initiated_role, initiated_at, handed_over_by)
+            VALUES (?, '进行中', ?, ?, ?, ?, ?)
+            """,
+            (batch_no, 1 if require_double else 0, req.operator, req.role, now, req.handed_over_by),
+        )
+        review_id = cur.lastrowid
+
+        for br in batch_boxes:
+            conn.execute(
+                "INSERT INTO batch_review_boxes (review_id, box_code) VALUES (?, ?)",
+                (review_id, br["box_code"]),
+            )
+
+        conn.execute(
+            "UPDATE batches SET review_status = '复核中', updated_at = ? WHERE batch_no = ?",
+            (now, batch_no),
+        )
+
+        _log_batch_audit(
+            conn, batch_no, None, "发起交接复核",
+            batch["review_status"], "复核中",
+            req.role, req.operator, None,
+            f"发起交接复核（{'双人复核' if require_double else '单人复核'}），交接人: {req.handed_over_by or '未指定'}，快照 {len(batch_boxes)} 箱",
+            now,
+        )
+
+        progress = _compute_review_progress(conn, review_id, require_double)
+
+    return {
+        "ok": True,
+        "review_id": review_id,
+        "batch_no": batch_no,
+        "require_double_review": require_double,
+        "initiated_at": now,
+        "initiated_by": req.operator,
+        "handed_over_by": req.handed_over_by,
+        "total_boxes": len(batch_boxes),
+        "progress": progress,
+    }
+
+
+@app.get("/api/batches/{batch_no}/review")
+def get_review_status(batch_no: str):
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        active = _get_active_review(conn, batch_no)
+        if not active:
+            last = conn.execute(
+                "SELECT * FROM batch_reviews WHERE batch_no = ? ORDER BY id DESC LIMIT 1",
+                (batch_no,),
+            ).fetchone()
+            if not last:
+                return {
+                    "batch_no": batch_no,
+                    "review_status": batch["review_status"],
+                    "active_review": None,
+                    "message": "该批次尚未发起过交接复核",
+                }
+            active = last
+
+        boxes = conn.execute(
+            "SELECT * FROM batch_review_boxes WHERE review_id = ? ORDER BY id",
+            (active["id"],),
+        ).fetchall()
+
+        progress = _compute_review_progress(
+            conn, active["id"], bool(active["require_double_review"])
+        )
+
+        result = {
+            "batch_no": batch_no,
+            "review_status": batch["review_status"],
+            "active_review": {
+                "review_id": active["id"],
+                "status": active["status"],
+                "require_double_review": bool(active["require_double_review"]),
+                "initiated_by": active["initiated_by"],
+                "initiated_role": active["initiated_role"],
+                "initiated_at": active["initiated_at"],
+                "handed_over_by": active["handed_over_by"],
+                "cancelled_at": active["cancelled_at"],
+                "cancelled_by": active["cancelled_by"],
+                "cancelled_reason": active["cancelled_reason"],
+                "completed_at": active["completed_at"],
+                "boxes": [dict(r) for r in boxes],
+            },
+            "progress": progress,
+        }
+
+        if bool(active["require_double_review"]):
+            result["progress"]["second_review_done"] = progress["second_review_done"]
+            result["progress"]["pending_second_review"] = progress["pending_second_review"]
+
+        return result
+
+
+@app.post("/api/batches/{batch_no}/review/boxes")
+def review_boxes(batch_no: str, req: ReviewBoxRequest):
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        active = _get_active_review(conn, batch_no)
+        if not active:
+            raise HTTPException(
+                409, f"批次 {batch_no} 没有进行中的复核，请先发起复核"
+            )
+
+        _check_review_conflict_on_receive(conn, batch_no)
+
+        require_double = bool(active["require_double_review"])
+        review_id = active["id"]
+
+        review_box_map = {
+            r["box_code"]: dict(r) for r in conn.execute(
+                "SELECT * FROM batch_review_boxes WHERE review_id = ?",
+                (review_id,),
+            ).fetchall()
+        }
+
+        now = datetime.now().isoformat()
+        processed = 0
+        skipped = 0
+        updated_boxes = []
+
+        for item in req.reviews:
+            if item.result not in VALID_REVIEW_RESULTS:
+                raise HTTPException(
+                    400,
+                    f"箱子 {item.box_code} 的复核结果「{item.result}」无效，"
+                    f"允许的值: {', '.join(sorted(VALID_REVIEW_RESULTS))}"
+                )
+
+            if item.box_code not in review_box_map:
+                raise HTTPException(
+                    400,
+                    f"箱子 {item.box_code} 不在当前复核单中（复核启动后新增的箱子需撤销重开）"
+                )
+
+            rb = review_box_map[item.box_code]
+
+            if not require_double:
+                conn.execute(
+                    """
+                    UPDATE batch_review_boxes
+                    SET first_review_result = ?, first_reviewer = ?, first_review_role = ?,
+                        first_review_reason = ?, first_review_at = ?, final_result = ?
+                    WHERE review_id = ? AND box_code = ?
+                    """,
+                    (item.result, req.operator, req.role, item.reason, now, item.result,
+                     review_id, item.box_code),
+                )
+                processed += 1
+                updated_boxes.append(item.box_code)
+            elif rb["first_review_result"] is None:
+                conn.execute(
+                    """
+                    UPDATE batch_review_boxes
+                    SET first_review_result = ?, first_reviewer = ?, first_review_role = ?,
+                        first_review_reason = ?, first_review_at = ?, final_result = ?
+                    WHERE review_id = ? AND box_code = ?
+                    """,
+                    (item.result, req.operator, req.role, item.reason, now, None,
+                     review_id, item.box_code),
+                )
+                processed += 1
+                updated_boxes.append(item.box_code)
+            elif rb["second_review_result"] is None:
+                if rb["first_reviewer"] == req.operator:
+                    raise HTTPException(
+                        409,
+                        f"双人复核要求不同人员，箱子 {item.box_code} 第一复核人已为「{req.operator}」"
+                    )
+                conn.execute(
+                    """
+                    UPDATE batch_review_boxes
+                    SET second_review_result = ?, second_reviewer = ?, second_review_role = ?,
+                        second_review_reason = ?, second_review_at = ?, final_result = ?
+                    WHERE review_id = ? AND box_code = ?
+                    """,
+                    (item.result, req.operator, req.role, item.reason, now, item.result,
+                     review_id, item.box_code),
+                )
+                processed += 1
+                updated_boxes.append(item.box_code)
+            else:
+                skipped += 1
+                continue
+
+            _log_batch_audit(
+                conn, batch_no, item.box_code, "交接复核",
+                None, None,
+                req.role, req.operator, item.reason,
+                f"复核结果: {item.result}",
+                now,
+            )
+
+        progress = _compute_review_progress(conn, review_id, require_double)
+
+    return {
+        "ok": True,
+        "review_id": review_id,
+        "processed": processed,
+        "skipped": skipped,
+        "updated_boxes": updated_boxes,
+        "progress": progress,
+    }
+
+
+@app.post("/api/batches/{batch_no}/review/cancel")
+def cancel_review(batch_no: str, req: ReviewCancelRequest):
+    if req.role != "仓库主管":
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权撤销交接复核，允许角色: ['仓库主管']",
+        )
+
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        active = _get_active_review(conn, batch_no)
+        if not active:
+            raise HTTPException(
+                409, f"批次 {batch_no} 没有进行中的复核，无法撤销"
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE batch_reviews
+            SET status = '已撤销', cancelled_at = ?, cancelled_by = ?, cancelled_reason = ?
+            WHERE id = ?
+            """,
+            (now, req.operator, req.reason, active["id"]),
+        )
+
+        conn.execute(
+            "UPDATE batches SET review_status = '未开始', updated_at = ? WHERE batch_no = ?",
+            (now, batch_no),
+        )
+
+        _log_batch_audit(
+            conn, batch_no, None, "撤销交接复核",
+            "复核中", "未开始",
+            req.role, req.operator, req.reason,
+            f"复核单 ID {active['id']} 已撤销，原因: {req.reason}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "batch_no": batch_no,
+        "review_id": active["id"],
+        "cancelled_at": now,
+        "cancelled_by": req.operator,
+        "reason": req.reason,
+    }
+
+
+@app.post("/api/batches/{batch_no}/archive")
+def archive_batch(batch_no: str, req: ArchiveRequest):
+    if req.role != "仓库主管":
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权归档批次，允许角色: ['仓库主管']",
+        )
+
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        if batch["status"] == "已归档":
+            raise HTTPException(409, f"批次 {batch_no} 已归档，不可重复归档")
+
+        if batch["status"] != "已签收":
+            raise HTTPException(
+                409,
+                f"批次当前状态「{batch['status']}」不允许归档，必须在「已签收」后归档"
+            )
+
+        last_review = conn.execute(
+            "SELECT * FROM batch_reviews WHERE batch_no = ? ORDER BY id DESC LIMIT 1",
+            (batch_no,),
+        ).fetchone()
+
+        if not last_review:
+            raise HTTPException(
+                409,
+                f"批次 {batch_no} 未完成交接复核，不允许归档。请先发起并完成复核。"
+            )
+
+        if last_review["status"] == "已撤销":
+            raise HTTPException(
+                409,
+                f"批次 {batch_no} 最近一次复核已撤销，需重新发起并完成复核后才能归档"
+            )
+
+        if last_review["status"] != "已完成":
+            progress = _compute_review_progress(
+                conn, last_review["id"], bool(last_review["require_double_review"])
+            )
+            if not progress["all_reviewed"]:
+                pending_msg = []
+                if progress["pending_first_review"]:
+                    pending_msg.append(f"待一复: {', '.join(progress['pending_first_review'])}")
+                if progress["pending_second_review"]:
+                    pending_msg.append(f"待二复: {', '.join(progress['pending_second_review'])}")
+                if progress["pending_temp_confirmation"]:
+                    pending_msg.append(f"温控待确认: {', '.join(progress['pending_temp_confirmation'])}")
+                raise HTTPException(
+                    409,
+                    f"批次 {batch_no} 复核未完成，不允许归档。{'；'.join(pending_msg)}"
+                )
+
+        _check_review_conflict_on_receive(conn, batch_no)
+
+        now = datetime.now().isoformat()
+
+        if last_review["status"] != "已完成":
+            conn.execute(
+                "UPDATE batch_reviews SET status = '已完成', completed_at = ? WHERE id = ?",
+                (now, last_review["id"]),
+            )
+
+        conn.execute(
+            """
+            UPDATE batches
+            SET status = '已归档', review_status = '已归档',
+                archived_at = ?, archived_by = ?, updated_at = ?
+            WHERE batch_no = ?
+            """,
+            (now, req.operator, now, batch_no),
+        )
+
+        _log_batch_audit(
+            conn, batch_no, None, "批次归档",
+            "已签收", "已归档",
+            req.role, req.operator, None,
+            "批次交接复核完成，正式归档",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "batch_no": batch_no,
+        "archived_at": now,
+        "archived_by": req.operator,
+    }
