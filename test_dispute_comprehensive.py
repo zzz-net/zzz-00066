@@ -245,6 +245,13 @@ def main():
     })
     test("非创建人撤回被拦截", status, expected_status=403)
 
+    print("  2.4b 同角色不同人不可撤回 → 403")
+    status, data = api("POST", f"/api/dispute/tickets/{ticket2_id}/withdraw", {
+        "role": "库房签收员", "operator": "王六",
+        "reason": "同角色不同人越权撤回",
+    })
+    test("同角色不同人撤回被拦截", status, expected_status=403)
+
     print("  2.5 质控在单确认模式下不可确认 → 403")
     api("POST", "/api/dispute/config", {
         "require_double_confirm": False, "operator": "管理员A",

@@ -2022,7 +2022,8 @@ def archive_batch(batch_no: str, req: ArchiveRequest):
 
 # ── Dispute Accountability Module ────────────────────────────────────────────
 
-DISPUTE_CREATE_ROLES = {"库房签收员", "仓库主管", "质控"}
+DISPUTE_CREATE_ROLES = {"库房签收员", "仓库主管", "质控", "班组长"}
+DISPUTE_PROXY_ROLES = {"班组长", "仓库主管", "质控"}
 DISPUTE_CONFIRM_ROLES = {"仓库主管", "质控"}
 DISPUTE_CLOSE_ROLES = {"仓库主管", "质控"}
 DISPUTE_EVIDENCE_ROLES = {"库房签收员", "仓库主管", "质控"}
@@ -2036,7 +2037,7 @@ def _get_dispute_config(conn):
     if not row:
         now = datetime.now().isoformat()
         conn.execute(
-            "INSERT INTO dispute_config (id, require_double_confirm, updated_at, updated_by) VALUES (1, 0, ?, '系统初始化')",
+            "INSERT INTO dispute_config (id, require_double_confirm, allow_proxy_submit, updated_at, updated_by) VALUES (1, 0, 0, ?, '系统初始化')",
             (now,),
         )
         row = conn.execute("SELECT * FROM dispute_config WHERE id = 1").fetchone()
@@ -2084,6 +2085,8 @@ def _build_ticket_detail(conn, ticket):
         "require_double_confirm": bool(ticket["require_double_confirm"]),
         "created_by": ticket["created_by"],
         "created_role": ticket["created_role"],
+        "submitted_by": ticket["submitted_by"],
+        "proxy_submitted": bool(ticket["proxy_submitted"]),
         "created_at": ticket["created_at"],
         "updated_at": ticket["updated_at"],
         "supervisor_confirmed": bool(ticket["supervisor_confirmed"]),
@@ -2115,6 +2118,7 @@ def get_dispute_config():
         cfg = _get_dispute_config(conn)
     return {
         "require_double_confirm": bool(cfg["require_double_confirm"]),
+        "allow_proxy_submit": bool(cfg["allow_proxy_submit"]),
         "updated_at": cfg["updated_at"],
         "updated_by": cfg["updated_by"],
     }
@@ -2123,15 +2127,24 @@ def get_dispute_config():
 @app.post("/api/dispute/config")
 def update_dispute_config(data: DisputeConfigUpdate):
     with get_db() as conn:
-        _get_dispute_config(conn)
+        cfg = _get_dispute_config(conn)
         now = datetime.now().isoformat()
-        conn.execute(
-            "UPDATE dispute_config SET require_double_confirm = ?, updated_at = ?, updated_by = ? WHERE id = 1",
-            (1 if data.require_double_confirm else 0, now, data.operator),
-        )
+        if data.allow_proxy_submit is not None:
+            conn.execute(
+                "UPDATE dispute_config SET require_double_confirm = ?, allow_proxy_submit = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+                (1 if data.require_double_confirm else 0,
+                 1 if data.allow_proxy_submit else 0,
+                 now, data.operator),
+            )
+        else:
+            conn.execute(
+                "UPDATE dispute_config SET require_double_confirm = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+                (1 if data.require_double_confirm else 0, now, data.operator),
+            )
     return {
         "ok": True,
         "require_double_confirm": data.require_double_confirm,
+        "allow_proxy_submit": data.allow_proxy_submit if data.allow_proxy_submit is not None else bool(cfg["allow_proxy_submit"]),
     }
 
 
@@ -2146,7 +2159,24 @@ def create_dispute_ticket(data: DisputeTicketCreate):
     if not data.box_codes:
         raise HTTPException(400, "争议单必须关联至少一个箱号")
 
+    is_proxy = data.on_behalf_of is not None and data.on_behalf_of != ""
+
     with get_db() as conn:
+        cfg = _get_dispute_config(conn)
+        allow_proxy = bool(cfg["allow_proxy_submit"])
+
+        if is_proxy:
+            if not allow_proxy:
+                raise HTTPException(
+                    403,
+                    "当前配置不允许代理提交，请联系管理员开启 allow_proxy_submit 配置",
+                )
+            if data.role not in DISPUTE_PROXY_ROLES:
+                raise HTTPException(
+                    403,
+                    f"角色「{data.role}」无权代理提交争议单，允许代理角色: {sorted(DISPUTE_PROXY_ROLES)}",
+                )
+
         batch = conn.execute(
             "SELECT * FROM batches WHERE batch_no = ?", (data.batch_no,)
         ).fetchone()
@@ -2186,23 +2216,27 @@ def create_dispute_ticket(data: DisputeTicketCreate):
                     f"箱号 {bc} 不在批次 {data.batch_no} 的已签收箱子中，不允许跨批次混填",
                 )
 
-        cfg = _get_dispute_config(conn)
         require_double = bool(cfg["require_double_confirm"])
 
         now = datetime.now().isoformat()
         ticket_no = f"DSP-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
 
+        created_by = data.on_behalf_of if is_proxy else data.operator
+        submitted_by = data.operator if is_proxy else None
+
         cur = conn.execute(
             """
             INSERT INTO dispute_tickets (ticket_no, batch_no, status, problem_type,
                 evidence_desc, responsibility_judgment, deadline, conclusion,
-                require_double_confirm, created_by, created_role, created_at, updated_at)
-            VALUES (?, ?, '待确认', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                require_double_confirm, created_by, created_role, submitted_by,
+                proxy_submitted, created_at, updated_at)
+            VALUES (?, ?, '待确认', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
             """,
             (ticket_no, data.batch_no, data.problem_type,
              data.evidence_desc, data.responsibility_judgment,
              data.deadline, 1 if require_double else 0,
-             data.operator, data.role, now, now),
+             created_by, data.role, submitted_by,
+             1 if is_proxy else 0, now, now),
         )
         ticket_id = cur.lastrowid
 
@@ -2221,11 +2255,14 @@ def create_dispute_ticket(data: DisputeTicketCreate):
                 (ticket_id, data.evidence_desc, data.operator, data.role, now),
             )
 
+        proxy_detail = ""
+        if is_proxy:
+            proxy_detail = f"，代理提交：实际提交人 {data.operator}，代 {data.on_behalf_of} 创建"
         _log_dispute_audit(
             conn, ticket_id, "创建争议单", None, "待确认",
             data.role, data.operator, data.evidence_desc,
             f"关联批次 {data.batch_no}，{len(data.box_codes)} 箱，问题类型: {data.problem_type}，"
-            f"{'双确认' if require_double else '单确认'}模式",
+            f"{'双确认' if require_double else '单确认'}模式{proxy_detail}",
             now,
         )
 
@@ -2235,6 +2272,9 @@ def create_dispute_ticket(data: DisputeTicketCreate):
         "ticket_no": ticket_no,
         "status": "待确认",
         "require_double_confirm": require_double,
+        "created_by": created_by,
+        "submitted_by": submitted_by,
+        "proxy_submitted": is_proxy,
     }
 
 
@@ -2432,7 +2472,7 @@ def withdraw_dispute_ticket(ticket_id: int, req: DisputeWithdrawRequest):
                 f"争议工单当前状态「{ticket['status']}」不允许撤回，仅「处理中」状态可撤回",
             )
 
-        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+        if req.operator != ticket["created_by"]:
             raise HTTPException(
                 403,
                 f"仅工单创建人可撤回，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
@@ -2476,7 +2516,7 @@ def reopen_dispute_ticket(ticket_id: int, req: DisputeReopenRequest):
                 f"争议工单当前状态「{ticket['status']}」不允许重开，仅「已撤回」状态可重开",
             )
 
-        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+        if req.operator != ticket["created_by"]:
             raise HTTPException(
                 403,
                 f"仅工单创建人可重开，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
@@ -2522,7 +2562,7 @@ def resubmit_dispute_ticket(ticket_id: int, req: DisputeResubmitRequest):
                 f"争议工单当前状态「{ticket['status']}」不允许重新提交，仅「已驳回」状态可重新提交",
             )
 
-        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+        if req.operator != ticket["created_by"]:
             raise HTTPException(
                 403,
                 f"仅工单创建人可重新提交，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
@@ -2767,6 +2807,8 @@ def export_dispute_json(status: str = None, batch_no: str = None):
                 "require_double_confirm": bool(t["require_double_confirm"]),
                 "created_by": t["created_by"],
                 "created_role": t["created_role"],
+                "submitted_by": t["submitted_by"],
+                "proxy_submitted": bool(t["proxy_submitted"]),
                 "created_at": t["created_at"],
                 "supervisor_confirmed": bool(t["supervisor_confirmed"]),
                 "supervisor_confirmed_by": t["supervisor_confirmed_by"],
@@ -2806,7 +2848,9 @@ def export_dispute_csv(status: str = None, batch_no: str = None):
         fields = [
             "ticket_id", "ticket_no", "batch_no", "status", "problem_type",
             "evidence_desc", "responsibility_judgment", "deadline", "conclusion",
-            "require_double_confirm", "created_by", "created_role", "created_at",
+            "require_double_confirm", "created_by", "created_role",
+            "submitted_by", "proxy_submitted",
+            "created_at",
             "supervisor_confirmed", "supervisor_confirmed_by",
             "qc_confirmed", "qc_confirmed_by",
             "closed_by", "closed_at", "box_codes",
@@ -2834,6 +2878,8 @@ def export_dispute_csv(status: str = None, batch_no: str = None):
                 "require_double_confirm": bool(t["require_double_confirm"]),
                 "created_by": t["created_by"],
                 "created_role": t["created_role"],
+                "submitted_by": t["submitted_by"] or "",
+                "proxy_submitted": bool(t["proxy_submitted"]),
                 "created_at": t["created_at"],
                 "supervisor_confirmed": bool(t["supervisor_confirmed"]),
                 "supervisor_confirmed_by": t["supervisor_confirmed_by"] or "",

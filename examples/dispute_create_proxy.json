@@ -1,0 +1,11 @@
+{
+  "batch_no": "BATCH-DSP-001",
+  "box_codes": ["DV001", "DV002"],
+  "problem_type": "温度超标",
+  "evidence_desc": "班组长代一线员工补录：运输途中多次超过8°C",
+  "responsibility_judgment": "转运方责任",
+  "deadline": "2026-06-26T18:00:00",
+  "role": "班组长",
+  "operator": "刘班长",
+  "on_behalf_of": "一线员工张三"
+}

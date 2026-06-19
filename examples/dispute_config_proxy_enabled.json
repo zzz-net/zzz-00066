@@ -1,0 +1,5 @@
+{
+  "require_double_confirm": false,
+  "allow_proxy_submit": true,
+  "operator": "管理员A"
+}

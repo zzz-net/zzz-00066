@@ -200,6 +200,7 @@ class ReviewBoxDetail(BaseModel):
 
 class DisputeConfigUpdate(BaseModel):
     require_double_confirm: bool
+    allow_proxy_submit: Optional[bool] = None
     operator: str
 
 
@@ -212,6 +213,7 @@ class DisputeTicketCreate(BaseModel):
     deadline: Optional[str] = None
     role: str
     operator: str
+    on_behalf_of: Optional[str] = None
 
 
 class DisputeConfirmRequest(BaseModel):

@@ -175,6 +175,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS dispute_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                allow_proxy_submit INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
                 updated_by TEXT NOT NULL
             )
@@ -195,6 +196,8 @@ def init_db():
                 require_double_confirm INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL,
                 created_role TEXT NOT NULL,
+                submitted_by TEXT,
+                proxy_submitted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 supervisor_confirmed INTEGER NOT NULL DEFAULT 0,
@@ -361,6 +364,7 @@ def _migrate_db(conn):
             CREATE TABLE IF NOT EXISTS dispute_config (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                allow_proxy_submit INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
                 updated_by TEXT NOT NULL
             )
@@ -384,6 +388,8 @@ def _migrate_db(conn):
                 require_double_confirm INTEGER NOT NULL DEFAULT 0,
                 created_by TEXT NOT NULL,
                 created_role TEXT NOT NULL,
+                submitted_by TEXT,
+                proxy_submitted INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 supervisor_confirmed INTEGER NOT NULL DEFAULT 0,
@@ -457,5 +463,17 @@ def _migrate_db(conn):
             )
             """
         )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE dispute_config ADD COLUMN allow_proxy_submit INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE dispute_tickets ADD COLUMN submitted_by TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE dispute_tickets ADD COLUMN proxy_submitted INTEGER NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass

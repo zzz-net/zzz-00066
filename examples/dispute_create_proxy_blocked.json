@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-DSP-001",
+  "box_codes": ["DV001"],
+  "problem_type": "温度超标",
+  "evidence_desc": "班组长试图代理但未开启代理配置",
+  "role": "班组长",
+  "operator": "刘班长",
+  "on_behalf_of": "一线员工张三"
+}
