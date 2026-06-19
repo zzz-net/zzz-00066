@@ -90,6 +90,10 @@ class BatchBoxOut(BaseModel):
     received_at: Optional[str] = None
     missing_reason: Optional[str] = None
     missing_registered_at: Optional[str] = None
+    missing_registered_by: Optional[str] = None
+    missing_cancelled_at: Optional[str] = None
+    missing_cancelled_by: Optional[str] = None
+    missing_cancel_reason: Optional[str] = None
 
 
 class BatchDetailOut(BaseModel):

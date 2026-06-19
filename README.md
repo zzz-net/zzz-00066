@@ -28,6 +28,16 @@ python run_examples.py admin          # 管理员操作 + 导出/审计对齐
 python run_examples.py persistence    # 重启后持久化（需先重启服务）
 ```
 
+### 批次签收全面回归测试
+
+```bash
+# 覆盖部分签收、撤销后再签收、越权撤销、重启恢复、导出核对、重复到达拦截
+python test_batch_comprehensive.py
+
+# 基础冒烟测试
+python test_batch_smoke.py
+```
+
 > 所有请求体都从 `examples/*.json` 读取，避免 PowerShell / bash 之间的引号、中文编码差异。
 
 ---

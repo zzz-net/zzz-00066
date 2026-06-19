@@ -92,6 +92,9 @@ def init_db():
                 missing_reason TEXT,
                 missing_registered_at TEXT,
                 missing_registered_by TEXT,
+                missing_cancelled_at TEXT,
+                missing_cancelled_by TEXT,
+                missing_cancel_reason TEXT,
                 UNIQUE(batch_no, box_code)
             )
             """
@@ -123,5 +126,17 @@ def _migrate_db(conn):
         pass
     try:
         conn.execute("ALTER TABLE audit_log ADD COLUMN batch_no TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batch_boxes ADD COLUMN missing_cancelled_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batch_boxes ADD COLUMN missing_cancelled_by TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE batch_boxes ADD COLUMN missing_cancel_reason TEXT")
     except sqlite3.OperationalError:
         pass

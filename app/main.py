@@ -62,7 +62,7 @@ BATCH_TRANSITIONS = {
         "roles": ["出库员"],
     },
     "arrive": {
-        "from": ["转运中"],
+        "from": ["转运中", "待签收", "部分签收"],
         "to": "待签收",
         "roles": ["转运员"],
     },
@@ -650,7 +650,9 @@ def get_batch(batch_no: str):
         boxes = conn.execute(
             """
             SELECT b.box_code, b.sample_type, b.status, bb.box_batch_status,
-                   bb.received_at, bb.missing_reason, bb.missing_registered_at
+                   bb.received_at, bb.missing_reason, bb.missing_registered_at,
+                   bb.missing_registered_by, bb.missing_cancelled_at,
+                   bb.missing_cancelled_by, bb.missing_cancel_reason
             FROM batch_boxes bb
             JOIN boxes b ON bb.box_code = b.box_code
             WHERE bb.batch_no = ?
@@ -735,6 +737,7 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
         now = datetime.now().isoformat()
         success_count = 0
         fail_count = 0
+        skip_count = 0
         temp_violation_any = False
         timeout_violation_any = False
 
@@ -749,11 +752,20 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
 
             box_current = box["status"]
             if box_current in TERMINAL_STATES:
-                fail_count += 1
+                skip_count += 1
                 continue
 
             box_rule = TRANSITIONS[action]
             if box_current not in box_rule["from"]:
+                if action == "arrive" and box_current in ("待签收", "已签收", "部分签收"):
+                    skip_count += 1
+                    continue
+                if action == "dispatch" and box_current in ("转运中", "待签收", "已签收"):
+                    skip_count += 1
+                    continue
+                if action == "receive" and box_current == "已签收":
+                    skip_count += 1
+                    continue
                 fail_count += 1
                 continue
 
@@ -822,7 +834,17 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
         if temp_violation_any or timeout_violation_any:
             batch_target = "异常待处理"
         else:
-            batch_target = target_status
+            stats = _update_batch_stats(conn, batch_no)
+            has_missing = stats["missing_cnt"] > 0
+            all_received = stats["received_cnt"] >= stats["total"]
+            has_partial = stats["received_cnt"] > 0 and not all_received
+
+            if all_received and not has_missing:
+                batch_target = "已签收"
+            elif has_partial or has_missing:
+                batch_target = "部分签收"
+            else:
+                batch_target = target_status
 
         conn.execute(
             "UPDATE batches SET status = ?, updated_at = ? WHERE batch_no = ?",
@@ -834,7 +856,7 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
             conn, batch_no, None, f"批次{_action_label(action)}",
             current_status, batch_target,
             req.role, req.operator, req.reason,
-            f"成功 {success_count} 箱, 失败 {fail_count} 箱, 共{stats['total']}箱, 已签收{stats['received_cnt']}箱, 缺失{stats['missing_cnt']}箱",
+            f"成功 {success_count} 箱, 跳过 {skip_count} 箱, 失败 {fail_count} 箱, 共{stats['total']}箱, 已签收{stats['received_cnt']}箱, 缺失{stats['missing_cnt']}箱",
             now,
         )
 
@@ -844,6 +866,7 @@ def _batch_transition(batch_no: str, action: str, req: BatchTransitionRequest):
         "from": current_status,
         "to": batch_target,
         "success_count": success_count,
+        "skip_count": skip_count,
         "fail_count": fail_count,
     }
     if temp_violation_any:
@@ -905,13 +928,20 @@ def receive_batch(batch_no: str, req: BatchReceiveRequest):
 
         now = datetime.now().isoformat()
         received_count = 0
+        skip_count = 0
         missing_registered_count = 0
         temp_violation_any = False
 
         for box_code in req.received_boxes:
             box_info = batch_box_codes[box_code]
             if box_info["status"] == "已签收":
+                skip_count += 1
                 continue
+            if box_info["box_batch_status"] == "缺失":
+                raise HTTPException(
+                    409,
+                    f"箱子 {box_code} 已登记为缺失，请先撤销缺失登记后再签收",
+                )
             if box_info["status"] != "待签收":
                 raise HTTPException(
                     409,
@@ -1004,7 +1034,7 @@ def receive_batch(batch_no: str, req: BatchReceiveRequest):
             conn, batch_no, None, "批次签收",
             current_status, batch_target,
             req.role, req.operator, req.reason,
-            f"签收 {received_count} 箱, 登记缺失 {missing_registered_count} 箱, "
+            f"签收 {received_count} 箱, 跳过 {skip_count} 箱, 登记缺失 {missing_registered_count} 箱, "
             f"共{stats['total']}箱, 已签收{stats['received_cnt']}箱, 缺失{stats['missing_cnt']}箱",
             now,
         )
@@ -1015,6 +1045,7 @@ def receive_batch(batch_no: str, req: BatchReceiveRequest):
         "from": current_status,
         "to": batch_target,
         "received_count": received_count,
+        "skip_count": skip_count,
         "missing_registered_count": missing_registered_count,
         "total_boxes": stats["total"],
         "received_boxes": stats["received_cnt"],
@@ -1105,6 +1136,10 @@ def register_missing_boxes(batch_no: str, req: MissingBoxRegisterRequest):
         "ok": True,
         "batch_no": batch_no,
         "registered_count": registered,
+        "total_boxes": stats["total"],
+        "received_boxes": stats["received_cnt"],
+        "missing_boxes": stats["missing_cnt"],
+        "batch_status": batch_target,
     }
 
 
@@ -1147,28 +1182,33 @@ def cancel_missing_boxes(batch_no: str, req: MissingBoxCancelRequest):
                 """
                 UPDATE batch_boxes SET box_batch_status = '正常',
                        missing_reason = NULL, missing_registered_at = NULL,
-                       missing_registered_by = NULL
+                       missing_registered_by = NULL,
+                       missing_cancelled_at = ?, missing_cancelled_by = ?,
+                       missing_cancel_reason = ?
                 WHERE batch_no = ? AND box_code = ?
                 """,
-                (batch_no, box_code),
+                (now, req.operator, req.reason, batch_no, box_code),
             )
             cancelled += 1
             _log_batch_audit(
                 conn, batch_no, box_code, "撤销缺失登记",
                 None, None,
                 req.role, req.operator, req.reason,
-                f"管理员撤销箱子 {box_code} 的缺失登记",
+                f"管理员撤销箱子 {box_code} 的缺失登记，原因: {req.reason or '未说明'}",
                 now,
             )
 
         stats = _update_batch_stats(conn, batch_no)
         has_missing = stats["missing_cnt"] > 0
         all_received = stats["received_cnt"] >= stats["total"]
+        has_partial = stats["received_cnt"] > 0 and not all_received
 
         batch_target = batch["status"]
         if not has_missing and all_received:
             batch_target = "已签收"
-        elif not has_missing and batch["status"] == "部分签收":
+        elif not has_missing and has_partial:
+            batch_target = "部分签收"
+        elif not has_missing and not has_partial:
             batch_target = "待签收"
 
         if batch_target != batch["status"]:
@@ -1188,6 +1228,10 @@ def cancel_missing_boxes(batch_no: str, req: MissingBoxCancelRequest):
         "ok": True,
         "batch_no": batch_no,
         "cancelled_count": cancelled,
+        "total_boxes": stats["total"],
+        "received_boxes": stats["received_cnt"],
+        "missing_boxes": stats["missing_cnt"],
+        "batch_status": batch_target,
     }
 
 
@@ -1259,6 +1303,30 @@ def export_json(batch_no: str = None):
                 "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
             ).fetchone()
             if batch:
+                boxes = conn.execute(
+                    """
+                    SELECT bb.box_code, bb.box_batch_status, b.status,
+                           bb.received_at, bb.missing_reason, bb.missing_registered_at,
+                           bb.missing_registered_by, bb.missing_cancelled_at,
+                           bb.missing_cancelled_by, bb.missing_cancel_reason
+                    FROM batch_boxes bb
+                    JOIN boxes b ON bb.box_code = b.box_code
+                    WHERE bb.batch_no = ?
+                    ORDER BY bb.id
+                    """,
+                    (batch_no,),
+                ).fetchall()
+
+                pending = [
+                    r["box_code"] for r in boxes
+                    if r["status"] not in TERMINAL_STATES and r["box_batch_status"] != "缺失"
+                ]
+
+                batch_audit = conn.execute(
+                    "SELECT * FROM batch_audit_log WHERE batch_no = ? ORDER BY id",
+                    (batch_no,),
+                ).fetchall()
+
                 result["batch_summary"] = {
                     "batch_no": batch["batch_no"],
                     "sample_type": batch["sample_type"],
@@ -1266,7 +1334,14 @@ def export_json(batch_no: str = None):
                     "total_boxes": batch["total_boxes"],
                     "received_boxes": batch["received_boxes"],
                     "missing_boxes": batch["missing_boxes"],
+                    "pending_boxes": len(pending),
+                    "pending_todos": pending,
                     "scheduled_outbound_time": batch["scheduled_outbound_time"],
                     "estimated_arrival_deadline": batch["estimated_arrival_deadline"],
+                    "created_at": batch["created_at"],
+                    "updated_at": batch["updated_at"],
+                    "created_by": batch["created_by"],
                 }
+                result["batch_boxes"] = [dict(r) for r in boxes]
+                result["batch_audit_log"] = [dict(r) for r in batch_audit]
     return result
