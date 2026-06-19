@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-EXC-001",
+  "box_code": "EXC001",
+  "reason_category": "包装破损",
+  "description": "班组长代录：发现外包装严重变形，内部缓冲材料破损",
+  "role": "班组长",
+  "operator": "周班长",
+  "on_behalf_of": "王五"
+}

@@ -1,0 +1,8 @@
+{
+  "batch_no": "BATCH-EXC-001",
+  "box_code": "EXC001",
+  "reason_category": "温度异常",
+  "description": "开箱时发现温度记录仪显示运输途中多次超过8°C，疫苗有变质风险",
+  "role": "库房签收员",
+  "operator": "王五"
+}

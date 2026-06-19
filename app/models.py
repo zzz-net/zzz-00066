@@ -258,3 +258,68 @@ class DisputeEvidenceRequest(BaseModel):
     evidence_desc: str
     role: str
     operator: str
+
+
+# ── Exception Ticket (仓内异常处置单) Models ────────────────────────────────
+
+
+class ExceptionConfigUpdate(BaseModel):
+    allow_proxy_record: bool
+    operator: str
+
+
+class ExceptionTicketCreate(BaseModel):
+    batch_no: Optional[str] = None
+    box_code: Optional[str] = None
+    reason_category: str
+    description: Optional[str] = None
+    role: str
+    operator: str
+    on_behalf_of: Optional[str] = None
+
+
+class ExceptionEvidenceAdd(BaseModel):
+    evidence_type: str = "text"
+    evidence_content: str
+    role: str
+    operator: str
+
+
+class ExceptionTransferRequest(BaseModel):
+    target_handler: str
+    target_handler_role: str
+    transfer_reason: Optional[str] = None
+    role: str
+    operator: str
+
+
+class ExceptionWithdrawRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class ExceptionRejectRequest(BaseModel):
+    role: str
+    operator: str
+    reason: str
+
+
+class ExceptionResubmitRequest(BaseModel):
+    role: str
+    operator: str
+    description: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ExceptionCloseRequest(BaseModel):
+    role: str
+    operator: str
+    conclusion: str
+    reason: Optional[str] = None
+
+
+class ExceptionConfirmRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None

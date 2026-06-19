@@ -576,6 +576,204 @@ python test_dispute_comprehensive.py
 
 ---
 
+## 6.6 仓内异常处置单模块
+
+围绕仓内发现的异常（温度异常、包装破损、数量差异、标签错误等）发起处置单，**明确分离发起人、代录人、当前处理人三个独立字段**，支持补充图片或文字证据、转交责任人、完整操作流水记录。转交责任后导出 CSV 可清晰看到完整责任流转链。
+
+### 核心设计：三字段分离
+
+| 字段 | 含义 | 普通创建 | 代录创建 |
+|------|------|---------|---------|
+| `initiator` | **发起人**（真正的异常发现人，拥有撤回/重提权限） | operator 本人 | on_behalf_of 指定的员工 |
+| `proxy_recorder` | **代录人**（代为录入系统的班组长/主管） | null | 代录的 operator |
+| `current_handler` | **当前处理人**（当前负责处置的责任人） | 发起人（初始值） | 发起人（初始值），转交后更新 |
+
+### 状态机
+
+```
+            库房管理员/仓库主管/质控/班组长/库房签收员
+                    创建处置单（班组长可代录）
+                            │
+                            ▼
+                        待处理 ──────── 仓库主管/质控驳回 ────────→ 已驳回
+                     │      │                                       │
+      仓库主管确认：   │      │                                      │ 发起人
+      仓库主管确认    │      │                                      │ 重新提交
+                     │      │                                      │ (补充证据)
+                     ▼      ▼                                       ▼
+                     处理中 ←─────────────────────────────── 待处理
+                  │      │
+       仓库主管/  │      │ 发起人
+       质控结案   │      │ 撤回
+       转交责任人 │      │
+                  ▼      ▼
+                已结案  已撤回
+                          │
+                          │ 发起人重提
+                          ▼
+                        待处理
+```
+
+**角色权限**：
+
+| 动作 | 允许角色 |
+|------|---------|
+| 创建处置单 | 库房管理员、仓库主管、质控、班组长、库房签收员 |
+| 代录处置单 | 班组长、仓库主管、质控（需开启 allow_proxy_record 配置） |
+| 确认/驳回 | 仓库主管、质控 |
+| 补充证据 | 库房管理员、仓库主管、质控、库房签收员 |
+| 转交责任人 | 仓库主管、质控、库房管理员 |
+| 撤回 | **仅发起人本人**（严格按 initiator 精确匹配，同角色不同人不可越权） |
+| 重提（撤回后）| **仅发起人本人** |
+| 重新提交（驳回后）| **仅发起人本人** |
+| 结案 | 仓库主管、质控 |
+
+**原因分类**：`温度异常`、`包装破损`、`数量差异`、`标签错误`、`污染风险`、`设备故障`、`流程违规`、`其他`
+
+**防护规则**：
+
+- **重复报单拦截**：同批次号 + 同箱号 + 同原因分类的活跃（待处理/处理中）工单不可重复创建，409 拦截
+- **撤回后重提重新校验权限**：重提时再次校验 `operator == initiator`，同时检查是否存在重复报单
+- **配置切换只影响新单**：`allow_proxy_record` 变更仅影响新建工单，已有工单的 `allow_proxy_record_at_create` 冻结不变
+- **越权操作全面拦截**：撤回、重提、重新提交严格校验 `operator == initiator`，同角色不同人一律 403
+
+### 代录机制
+
+班组长或主管代一线员工录入时：
+- `initiator` = `on_behalf_of`（被代理人，真正的发起人，享有撤回/重提权限）
+- `proxy_recorder` = `operator`（实际代录人）
+- `current_handler` = `initiator`（初始处理人为发起人）
+- 代录人**不享有**撤回/重提权限，只有被代理人（发起人）可以操作
+- 未开启 `allow_proxy_record` 时，传入 `on_behalf_of` 会被 403 拦截
+
+### 责任人转交与流转记录
+
+处理中状态下可转交责任人，每次转交都会：
+1. 更新 `current_handler` 和 `current_handler_role`
+2. 向 `exception_handler_transfers` 表写入一条转交记录（含转交原因、转交人、时间）
+3. JSON 导出包含 `responsibility_chain`（完整责任流转链：初始→每次转交→当前）
+4. CSV 导出的 `responsibility_transfers` 字段格式：`初始:发起人(角色) → A→B(角色)[转交人@时间] → ... → 当前:处理人(角色)`
+
+### 仓内异常处置单 curl 示例
+
+```bash
+# 配置：允许代录
+curl -sS -X POST http://localhost:8000/api/exception/config \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_config_proxy_enabled.json
+
+# 配置：禁止代录
+curl -sS -X POST http://localhost:8000/api/exception/config \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_config_proxy_disabled.json
+
+# 查询配置
+curl -sS http://localhost:8000/api/exception/config
+
+# 库房签收员创建处置单（普通方式）
+curl -sS -X POST http://localhost:8000/api/exception/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_create.json
+
+# 班组长代录处置单（需开启 allow_proxy_record）
+curl -sS -X POST http://localhost:8000/api/exception/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_create_proxy.json
+
+# 代录关闭时代录被拦截
+curl -sS -X POST http://localhost:8000/api/exception/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_create_proxy_blocked.json
+
+# 列出处置单（支持 ?status= / ?batch_no= / ?box_code= 筛选）
+curl -sS "http://localhost:8000/api/exception/tickets"
+curl -sS "http://localhost:8000/api/exception/tickets?status=处理中"
+curl -sS "http://localhost:8000/api/exception/tickets?batch_no=BATCH-EXC-001"
+curl -sS "http://localhost:8000/api/exception/tickets?box_code=EXC001"
+
+# 查看工单详情（含证据列表、转交历史、审计日志）
+curl -sS http://localhost:8000/api/exception/tickets/1
+
+# 仓库主管确认 → 进入处理中
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/confirm \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_confirm.json
+
+# 驳回处置单
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/reject \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_reject.json
+
+# 撤回处置单（仅发起人本人）
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/withdraw \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_withdraw.json
+
+# 重新提交（驳回/撤回后，仅发起人本人，可补充描述）
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/resubmit \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_resubmit.json
+
+# 补充证据（图片或文字）
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/evidence \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_evidence.json
+
+# 转交责任人
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/transfer \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_transfer.json
+
+# 结案（仅仓库主管/质控）
+curl -sS -X POST http://localhost:8000/api/exception/tickets/1/close \
+  -H "Content-Type: application/json" \
+  -d @examples/exception_close.json
+
+# 查看工单审计日志
+curl -sS http://localhost:8000/api/exception/tickets/1/audit
+
+# 查看批次异常汇总
+curl -sS http://localhost:8000/api/exception/batches/BATCH-EXC-001/summary
+
+# 导出 JSON（支持 ?status= / ?batch_no= / ?box_code= 筛选，含责任流转链）
+curl -sS "http://localhost:8000/api/exception/export/json"
+curl -sS "http://localhost:8000/api/exception/export/json?status=已结案"
+curl -sS "http://localhost:8000/api/exception/export/json?batch_no=BATCH-EXC-001"
+
+# 导出 CSV（含 responsibility_transfers 字段，清晰展示责任流转）
+curl -sS "http://localhost:8000/api/exception/export/csv" -o exception_tickets.csv
+```
+
+### 仓内异常处置单 API 端点一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/exception/config` | 查询代录配置 |
+| `POST` | `/api/exception/config` | 更新代录配置（只影响新工单） |
+| `POST` | `/api/exception/tickets` | 创建处置单（支持代录） |
+| `GET` | `/api/exception/tickets` | 工单列表（`?status=` `?batch_no=` `?box_code=` 筛选） |
+| `GET` | `/api/exception/tickets/{id}` | 工单详情（含证据、转交历史、审计日志） |
+| `POST` | `/api/exception/tickets/{id}/confirm` | 确认工单（仓库主管/质控） |
+| `POST` | `/api/exception/tickets/{id}/reject` | 驳回工单（仓库主管/质控） |
+| `POST` | `/api/exception/tickets/{id}/withdraw` | 撤回工单（仅发起人本人） |
+| `POST` | `/api/exception/tickets/{id}/resubmit` | 重新提交（仅发起人本人，从驳回/撤回） |
+| `POST` | `/api/exception/tickets/{id}/evidence` | 补充证据（文字/图片） |
+| `POST` | `/api/exception/tickets/{id}/transfer` | 转交责任人（仓库主管/质控/库房管理员） |
+| `POST` | `/api/exception/tickets/{id}/close` | 结案（仅仓库主管/质控） |
+| `GET` | `/api/exception/tickets/{id}/audit` | 工单审计日志 |
+| `GET` | `/api/exception/batches/{batch_no}/summary` | 批次异常汇总 |
+| `GET` | `/api/exception/export/json` | 导出 JSON（含责任流转链 responsibility_chain） |
+| `GET` | `/api/exception/export/csv` | 导出 CSV（含 responsibility_transfers 字段） |
+
+### 仓内异常处置单回归测试
+
+```bash
+# 覆盖 7 大场景：正常闭环、越权拦截、撤回重开、转交责任、配置切换、重启恢复、导出核对
+python test_exception_comprehensive.py
+```
+
+---
+
 ## 7. 项目结构
 
 ```
@@ -632,3 +830,6 @@ zzz-00066/
 | 越权结案 | 签收员可能越权关闭工单 | 结案操作仅仓库主管和质控可执行，签收员 403 |
 | 配置变更影响已有工单 | 切换双确认后旧工单被改变 | 配置冻结在创建时，变更只影响新工单 |
 | 争议数据重启丢失 | 处理中的工单状态可能丢失 | 全部存储在 SQLite WAL 模式，重启后完整恢复 |
+| 缺少代理提交能力 | 班组长无法代一线员工补录异常单 | 新增 `allow_proxy_submit` 配置和 `on_behalf_of` 参数，代理提交时 `created_by` 设为被代理人，`submitted_by` 记录实际提交人 |
+| **同角色不同人可越权撤回/重开/重新提交** | 撤回/重开/重新提交使用 `operator != created_by AND role != created_role` 的 OR 逻辑，同角色不同人可绕过 | 改为 `operator != created_by` 严格匹配创建人本人，同角色不同人不再放行 |
+| 代理提交配置回写历史单 | 切换配置后已有代理工单可能受影响 | `allow_proxy_submit` 配置仅控制新建时是否允许代理提交，已有工单的 `proxy_submitted` 标记不受配置变更影响 |

@@ -262,6 +262,99 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                allow_proxy_record INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT,
+                box_code TEXT,
+                reason_category TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT '待处理',
+                conclusion TEXT,
+                allow_proxy_record_at_create INTEGER NOT NULL DEFAULT 0,
+                initiator TEXT NOT NULL,
+                initiator_role TEXT NOT NULL,
+                proxy_recorder TEXT,
+                proxy_recorder_role TEXT,
+                current_handler TEXT NOT NULL,
+                current_handler_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL DEFAULT 'text',
+                evidence_content TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_handler_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                from_handler TEXT NOT NULL,
+                from_handler_role TEXT NOT NULL,
+                to_handler TEXT NOT NULL,
+                to_handler_role TEXT NOT NULL,
+                transferred_by TEXT NOT NULL,
+                transferred_role TEXT NOT NULL,
+                transfer_reason TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
         _migrate_db(conn)
 
 
@@ -475,5 +568,113 @@ def _migrate_db(conn):
         pass
     try:
         conn.execute("ALTER TABLE dispute_tickets ADD COLUMN proxy_submitted INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                allow_proxy_record INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT,
+                box_code TEXT,
+                reason_category TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT '待处理',
+                conclusion TEXT,
+                allow_proxy_record_at_create INTEGER NOT NULL DEFAULT 0,
+                initiator TEXT NOT NULL,
+                initiator_role TEXT NOT NULL,
+                proxy_recorder TEXT,
+                proxy_recorder_role TEXT,
+                current_handler TEXT NOT NULL,
+                current_handler_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL DEFAULT 'text',
+                evidence_content TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS exception_handler_transfers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                from_handler TEXT NOT NULL,
+                from_handler_role TEXT NOT NULL,
+                to_handler TEXT NOT NULL,
+                to_handler_role TEXT NOT NULL,
+                transferred_by TEXT NOT NULL,
+                transferred_role TEXT NOT NULL,
+                transfer_reason TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES exception_tickets(id)
+            )
+            """
+        )
     except sqlite3.OperationalError:
         pass

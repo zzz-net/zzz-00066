@@ -30,6 +30,15 @@ from app.models import (
     DisputeResubmitRequest,
     DisputeCloseRequest,
     DisputeEvidenceRequest,
+    ExceptionConfigUpdate,
+    ExceptionTicketCreate,
+    ExceptionEvidenceAdd,
+    ExceptionTransferRequest,
+    ExceptionWithdrawRequest,
+    ExceptionRejectRequest,
+    ExceptionResubmitRequest,
+    ExceptionCloseRequest,
+    ExceptionConfirmRequest,
 )
 
 app = FastAPI(title="冷链交接 API")
@@ -2895,4 +2904,922 @@ def export_dispute_csv(status: str = None, batch_no: str = None):
         io.BytesIO(output.getvalue().encode("utf-8-sig")),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=dispute_tickets.csv"},
+    )
+
+
+# ── Exception Ticket Module (仓内异常处置单) ────────────────────────────────
+
+EXCEPTION_CREATE_ROLES = {"库房管理员", "仓库主管", "质控", "班组长", "库房签收员"}
+EXCEPTION_PROXY_ROLES = {"班组长", "仓库主管", "质控"}
+EXCEPTION_CONFIRM_ROLES = {"仓库主管", "质控"}
+EXCEPTION_CLOSE_ROLES = {"仓库主管", "质控"}
+EXCEPTION_TRANSFER_ROLES = {"仓库主管", "质控", "库房管理员"}
+EXCEPTION_EVIDENCE_ROLES = {"库房管理员", "仓库主管", "质控", "库房签收员"}
+EXCEPTION_HANDLE_ROLES = {"库房管理员", "仓库主管", "质控"}
+
+EXCEPTION_STATUSES = {"待处理", "处理中", "已驳回", "已撤回", "已结案"}
+EXCEPTION_TERMINAL_STATUSES = {"已结案"}
+EXCEPTION_ACTIVE_STATUSES = {"待处理", "处理中"}
+
+EXCEPTION_REASON_CATEGORIES = {
+    "温度异常", "包装破损", "数量差异", "标签错误",
+    "污染风险", "设备故障", "流程违规", "其他"
+}
+
+
+def _get_exception_config(conn):
+    row = conn.execute("SELECT * FROM exception_config WHERE id = 1").fetchone()
+    if not row:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO exception_config (id, allow_proxy_record, updated_at, updated_by) VALUES (1, 0, ?, '系统初始化')",
+            (now,),
+        )
+        row = conn.execute("SELECT * FROM exception_config WHERE id = 1").fetchone()
+    return row
+
+
+def _log_exception_audit(conn, ticket_id, action, from_status, to_status,
+                         role, operator, reason, detail, created_at):
+    conn.execute(
+        """
+        INSERT INTO exception_audit_log (ticket_id, action, from_status, to_status,
+                                         role, operator, reason, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticket_id, action, from_status, to_status,
+         role, operator, reason, detail, created_at),
+    )
+
+
+def _get_exception_ticket(conn, ticket_id):
+    return conn.execute(
+        "SELECT * FROM exception_tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()
+
+
+def _build_exception_ticket_detail(conn, ticket):
+    evidence = conn.execute(
+        "SELECT * FROM exception_evidence WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    transfers = conn.execute(
+        "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    audit = conn.execute(
+        "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    return {
+        "id": ticket["id"],
+        "ticket_no": ticket["ticket_no"],
+        "batch_no": ticket["batch_no"],
+        "box_code": ticket["box_code"],
+        "reason_category": ticket["reason_category"],
+        "description": ticket["description"],
+        "status": ticket["status"],
+        "conclusion": ticket["conclusion"],
+        "allow_proxy_record_at_create": bool(ticket["allow_proxy_record_at_create"]),
+        "initiator": ticket["initiator"],
+        "initiator_role": ticket["initiator_role"],
+        "proxy_recorder": ticket["proxy_recorder"],
+        "proxy_recorder_role": ticket["proxy_recorder_role"],
+        "current_handler": ticket["current_handler"],
+        "current_handler_role": ticket["current_handler_role"],
+        "created_at": ticket["created_at"],
+        "updated_at": ticket["updated_at"],
+        "withdrawn_at": ticket["withdrawn_at"],
+        "withdrawn_by": ticket["withdrawn_by"],
+        "withdrawn_reason": ticket["withdrawn_reason"],
+        "resubmitted_at": ticket["resubmitted_at"],
+        "resubmitted_by": ticket["resubmitted_by"],
+        "rejected_at": ticket["rejected_at"],
+        "rejected_by": ticket["rejected_by"],
+        "rejected_role": ticket["rejected_role"],
+        "rejected_reason": ticket["rejected_reason"],
+        "closed_at": ticket["closed_at"],
+        "closed_by": ticket["closed_by"],
+        "closed_role": ticket["closed_role"],
+        "evidence_list": [dict(e) for e in evidence],
+        "transfer_history": [dict(t) for t in transfers],
+        "audit_log": [dict(a) for a in audit],
+    }
+
+
+def _check_duplicate_exception(conn, batch_no, box_code, reason_category, exclude_ticket_id=None):
+    query = """
+        SELECT * FROM exception_tickets
+        WHERE reason_category = ? AND status IN ('待处理', '处理中')
+    """
+    params = [reason_category]
+    if batch_no:
+        query += " AND batch_no = ?"
+        params.append(batch_no)
+    else:
+        query += " AND batch_no IS NULL"
+    if box_code:
+        query += " AND box_code = ?"
+        params.append(box_code)
+    else:
+        query += " AND box_code IS NULL"
+    if exclude_ticket_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_ticket_id)
+    return conn.execute(query, params).fetchone()
+
+
+@app.get("/api/exception/config")
+def get_exception_config():
+    with get_db() as conn:
+        cfg = _get_exception_config(conn)
+    return {
+        "allow_proxy_record": bool(cfg["allow_proxy_record"]),
+        "updated_at": cfg["updated_at"],
+        "updated_by": cfg["updated_by"],
+    }
+
+
+@app.post("/api/exception/config")
+def update_exception_config(data: ExceptionConfigUpdate):
+    with get_db() as conn:
+        _get_exception_config(conn)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE exception_config SET allow_proxy_record = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+            (1 if data.allow_proxy_record else 0, now, data.operator),
+        )
+    return {
+        "ok": True,
+        "allow_proxy_record": data.allow_proxy_record,
+    }
+
+
+@app.post("/api/exception/tickets")
+def create_exception_ticket(data: ExceptionTicketCreate):
+    if data.role not in EXCEPTION_CREATE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{data.role}」无权发起仓内异常处置单，允许角色: {sorted(EXCEPTION_CREATE_ROLES)}",
+        )
+
+    if not data.batch_no and not data.box_code:
+        raise HTTPException(400, "处置单必须关联批次号或箱号（至少填一个）")
+
+    if data.reason_category not in EXCEPTION_REASON_CATEGORIES:
+        raise HTTPException(
+            400,
+            f"原因分类「{data.reason_category}」无效，允许的值: {sorted(EXCEPTION_REASON_CATEGORIES)}"
+        )
+
+    is_proxy = data.on_behalf_of is not None and data.on_behalf_of != ""
+
+    with get_db() as conn:
+        cfg = _get_exception_config(conn)
+        allow_proxy = bool(cfg["allow_proxy_record"])
+
+        if is_proxy:
+            if not allow_proxy:
+                raise HTTPException(
+                    403,
+                    "当前配置不允许代录，请联系管理员开启 allow_proxy_record 配置",
+                )
+            if data.role not in EXCEPTION_PROXY_ROLES:
+                raise HTTPException(
+                    403,
+                    f"角色「{data.role}」无权代录处置单，允许代录角色: {sorted(EXCEPTION_PROXY_ROLES)}",
+                )
+
+        if data.batch_no:
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE batch_no = ?", (data.batch_no,)
+            ).fetchone()
+            if not batch:
+                raise HTTPException(404, f"批次 {data.batch_no} 不存在")
+
+        if data.box_code:
+            box = conn.execute(
+                "SELECT * FROM boxes WHERE box_code = ?", (data.box_code,)
+            ).fetchone()
+            if not box:
+                raise HTTPException(404, f"箱号 {data.box_code} 不存在")
+
+        dup = _check_duplicate_exception(conn, data.batch_no, data.box_code, data.reason_category)
+        if dup:
+            raise HTTPException(
+                409,
+                f"已存在相同批次/箱号+原因分类的活跃处置单（工单号: {dup['ticket_no']}），请勿重复报单"
+            )
+
+        initiator = data.on_behalf_of if is_proxy else data.operator
+        initiator_role = data.role if not is_proxy else None
+        proxy_recorder = data.operator if is_proxy else None
+        proxy_recorder_role = data.role if is_proxy else None
+        current_handler = initiator
+        current_handler_role = data.role
+
+        now = datetime.now().isoformat()
+        ticket_no = f"EXC-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+        cur = conn.execute(
+            """
+            INSERT INTO exception_tickets (
+                ticket_no, batch_no, box_code, reason_category, description,
+                status, conclusion, allow_proxy_record_at_create,
+                initiator, initiator_role, proxy_recorder, proxy_recorder_role,
+                current_handler, current_handler_role, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, '待处理', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_no, data.batch_no, data.box_code, data.reason_category,
+             data.description, 1 if allow_proxy else 0,
+             initiator, initiator_role if initiator_role else data.role,
+             proxy_recorder, proxy_recorder_role,
+             current_handler, current_handler_role,
+             now, now),
+        )
+        ticket_id = cur.lastrowid
+
+        if data.description:
+            conn.execute(
+                """
+                INSERT INTO exception_evidence (ticket_id, evidence_type, evidence_content, added_by, added_role, added_at)
+                VALUES (?, 'text', ?, ?, ?, ?)
+                """,
+                (ticket_id, data.description, data.operator, data.role, now),
+            )
+
+        proxy_detail = ""
+        if is_proxy:
+            proxy_detail = f"，代录：代录人 {data.operator}（{data.role}），代发起人 {data.on_behalf_of}"
+        _log_exception_audit(
+            conn, ticket_id, "创建处置单", None, "待处理",
+            data.role, data.operator, data.description,
+            f"原因分类: {data.reason_category}，关联批次: {data.batch_no or '无'}，关联箱号: {data.box_code or '无'}"
+            f"，发起人: {initiator}，当前处理人: {current_handler}{proxy_detail}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "ticket_no": ticket_no,
+        "status": "待处理",
+        "initiator": initiator,
+        "proxy_recorder": proxy_recorder,
+        "current_handler": current_handler,
+        "allow_proxy_record_at_create": allow_proxy,
+    }
+
+
+@app.get("/api/exception/tickets")
+def list_exception_tickets(status: str = None, batch_no: str = None, box_code: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM exception_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/exception/tickets/{ticket_id}")
+def get_exception_ticket(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+        return _build_exception_ticket_detail(conn, ticket)
+
+
+@app.post("/api/exception/tickets/{ticket_id}/confirm")
+def confirm_exception_ticket(ticket_id: int, req: ExceptionConfirmRequest):
+    if req.role not in EXCEPTION_CONFIRM_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权确认处置单，允许角色: {sorted(EXCEPTION_CONFIRM_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] != "待处理":
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许确认，仅「待处理」状态可确认",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            "UPDATE exception_tickets SET status = '处理中', updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "确认处置单", "待处理", "处理中",
+            req.role, req.operator, req.reason,
+            f"处置单确认进入处理中，当前处理人: {ticket['current_handler']}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "处理中",
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/reject")
+def reject_exception_ticket(ticket_id: int, req: ExceptionRejectRequest):
+    if req.role not in EXCEPTION_CONFIRM_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权驳回处置单，允许角色: {sorted(EXCEPTION_CONFIRM_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] != "待处理":
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许驳回，仅「待处理」状态可驳回",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE exception_tickets SET status = '已驳回', updated_at = ?,
+                rejected_at = ?, rejected_by = ?, rejected_role = ?, rejected_reason = ?
+            WHERE id = ?
+            """,
+            (now, now, req.operator, req.role, req.reason, ticket_id),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "驳回处置单", "待处理", "已驳回",
+            req.role, req.operator, req.reason,
+            f"驳回原因: {req.reason}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已驳回",
+        "rejected_by": req.operator,
+        "rejected_reason": req.reason,
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/withdraw")
+def withdraw_exception_ticket(ticket_id: int, req: ExceptionWithdrawRequest):
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] not in ("待处理", "处理中"):
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许撤回，仅「待处理」或「处理中」状态可撤回",
+            )
+
+        if req.operator != ticket["initiator"]:
+            raise HTTPException(
+                403,
+                f"仅处置单发起人可撤回，当前操作人「{req.operator}」不是发起人「{ticket['initiator']}」",
+            )
+
+        if req.role not in EXCEPTION_CREATE_ROLES:
+            raise HTTPException(
+                403,
+                f"角色「{req.role}」无权撤回处置单，允许角色: {sorted(EXCEPTION_CREATE_ROLES)}",
+            )
+
+        now = datetime.now().isoformat()
+        from_status = ticket["status"]
+
+        conn.execute(
+            """
+            UPDATE exception_tickets SET status = '已撤回', updated_at = ?,
+                withdrawn_at = ?, withdrawn_by = ?, withdrawn_reason = ?
+            WHERE id = ?
+            """,
+            (now, now, req.operator, req.reason, ticket_id),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "撤回处置单", from_status, "已撤回",
+            req.role, req.operator, req.reason,
+            f"发起人撤回处置单，原因: {req.reason or '未说明'}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已撤回",
+        "withdrawn_by": req.operator,
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/resubmit")
+def resubmit_exception_ticket(ticket_id: int, req: ExceptionResubmitRequest):
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] != "已驳回" and ticket["status"] != "已撤回":
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许重新提交，仅「已驳回」或「已撤回」状态可重新提交",
+            )
+
+        if req.operator != ticket["initiator"]:
+            raise HTTPException(
+                403,
+                f"仅处置单发起人可重新提交，当前操作人「{req.operator}」不是发起人「{ticket['initiator']}」",
+            )
+
+        if req.role not in EXCEPTION_CREATE_ROLES:
+            raise HTTPException(
+                403,
+                f"角色「{req.role}」无权重新提交处置单，允许角色: {sorted(EXCEPTION_CREATE_ROLES)}",
+            )
+
+        now = datetime.now().isoformat()
+
+        dup = _check_duplicate_exception(
+            conn, ticket["batch_no"], ticket["box_code"], ticket["reason_category"],
+            exclude_ticket_id=ticket_id
+        )
+        if dup:
+            raise HTTPException(
+                409,
+                f"已存在相同批次/箱号+原因分类的活跃处置单（工单号: {dup['ticket_no']}），请勿重复报单"
+            )
+
+        update_fields = [
+            "status = '待处理'", "updated_at = ?",
+            "rejected_at = NULL", "rejected_by = NULL", "rejected_role = NULL",
+            "rejected_reason = NULL",
+            "withdrawn_at = NULL", "withdrawn_by = NULL", "withdrawn_reason = NULL",
+            "resubmitted_at = ?", "resubmitted_by = ?",
+        ]
+        params = [now, now, req.operator]
+
+        if req.description:
+            update_fields.append("description = ?")
+            params.append(req.description)
+
+        params.append(ticket_id)
+
+        conn.execute(
+            f"UPDATE exception_tickets SET {', '.join(update_fields)} WHERE id = ?",
+            params,
+        )
+
+        detail_parts = [f"发起人重新提交处置单，当前处理人重置为: {ticket['initiator']}"]
+        if req.description:
+            detail_parts.append(f"补充描述: {req.description}")
+
+        _log_exception_audit(
+            conn, ticket_id, "重新提交处置单", ticket["status"], "待处理",
+            req.role, req.operator, req.reason,
+            "；".join(detail_parts), now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "待处理",
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/evidence")
+def add_exception_evidence(ticket_id: int, req: ExceptionEvidenceAdd):
+    if req.role not in EXCEPTION_EVIDENCE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权补充证据，允许角色: {sorted(EXCEPTION_EVIDENCE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] not in EXCEPTION_ACTIVE_STATUSES:
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许补充证据，仅「待处理」或「处理中」状态可补充",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO exception_evidence (ticket_id, evidence_type, evidence_content, added_by, added_role, added_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_id, req.evidence_type, req.evidence_content, req.operator, req.role, now),
+        )
+
+        conn.execute(
+            "UPDATE exception_tickets SET updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "补充证据", ticket["status"], ticket["status"],
+            req.role, req.operator, None,
+            f"补充证据（{req.evidence_type}）: {req.evidence_content}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "evidence_type": req.evidence_type,
+        "evidence_content": req.evidence_content,
+        "added_by": req.operator,
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/transfer")
+def transfer_exception_ticket(ticket_id: int, req: ExceptionTransferRequest):
+    if req.role not in EXCEPTION_TRANSFER_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权转交处置单责任人，允许角色: {sorted(EXCEPTION_TRANSFER_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] != "处理中":
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许转交责任人，仅「处理中」状态可转交",
+            )
+
+        now = datetime.now().isoformat()
+        from_handler = ticket["current_handler"]
+        from_handler_role = ticket["current_handler_role"]
+
+        conn.execute(
+            """
+            UPDATE exception_tickets
+            SET current_handler = ?, current_handler_role = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (req.target_handler, req.target_handler_role, now, ticket_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO exception_handler_transfers (
+                ticket_id, from_handler, from_handler_role, to_handler, to_handler_role,
+                transferred_by, transferred_role, transfer_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_id, from_handler, from_handler_role,
+             req.target_handler, req.target_handler_role,
+             req.operator, req.role, req.transfer_reason, now),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "转交责任人", "处理中", "处理中",
+            req.role, req.operator, req.transfer_reason,
+            f"责任人从 {from_handler}（{from_handler_role}）转交至 {req.target_handler}（{req.target_handler_role}），原因: {req.transfer_reason or '未说明'}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "from_handler": from_handler,
+        "to_handler": req.target_handler,
+        "to_handler_role": req.target_handler_role,
+    }
+
+
+@app.post("/api/exception/tickets/{ticket_id}/close")
+def close_exception_ticket(ticket_id: int, req: ExceptionCloseRequest):
+    if req.role not in EXCEPTION_CLOSE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权结案处置单，允许角色: {sorted(EXCEPTION_CLOSE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        if ticket["status"] != "处理中":
+            raise HTTPException(
+                409,
+                f"处置单当前状态「{ticket['status']}」不允许结案，仅「处理中」状态可结案",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE exception_tickets SET status = '已结案', updated_at = ?,
+                conclusion = ?, closed_at = ?, closed_by = ?, closed_role = ?
+            WHERE id = ?
+            """,
+            (now, req.conclusion, now, req.operator, req.role, ticket_id),
+        )
+
+        _log_exception_audit(
+            conn, ticket_id, "结案处置单", "处理中", "已结案",
+            req.role, req.operator, req.reason,
+            f"结案结论: {req.conclusion}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已结案",
+        "conclusion": req.conclusion,
+        "closed_by": req.operator,
+    }
+
+
+@app.get("/api/exception/tickets/{ticket_id}/audit")
+def get_exception_audit(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_exception_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"仓内异常处置单 {ticket_id} 不存在")
+
+        rows = conn.execute(
+            "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
+            (ticket_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/exception/batches/{batch_no}/summary")
+def get_batch_exception_summary(batch_no: str):
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        tickets = conn.execute(
+            "SELECT * FROM exception_tickets WHERE batch_no = ? ORDER BY created_at DESC",
+            (batch_no,),
+        ).fetchall()
+
+        total = len(tickets)
+        by_status = {}
+        by_category = {}
+        for t in tickets:
+            s = t["status"]
+            by_status[s] = by_status.get(s, 0) + 1
+            c = t["reason_category"]
+            by_category[c] = by_category.get(c, 0) + 1
+
+        ticket_summaries = []
+        for t in tickets:
+            ticket_summaries.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "status": t["status"],
+                "reason_category": t["reason_category"],
+                "box_code": t["box_code"],
+                "initiator": t["initiator"],
+                "current_handler": t["current_handler"],
+                "created_at": t["created_at"],
+                "conclusion": t["conclusion"],
+            })
+
+    return {
+        "batch_no": batch_no,
+        "batch_status": batch["status"],
+        "total_tickets": total,
+        "by_status": by_status,
+        "by_category": by_category,
+        "tickets": ticket_summaries,
+    }
+
+
+@app.get("/api/exception/export/json")
+def export_exception_json(status: str = None, batch_no: str = None, box_code: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM exception_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        result_rows = []
+        for t in tickets:
+            evidence = conn.execute(
+                "SELECT * FROM exception_evidence WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            transfers = conn.execute(
+                "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            audit = conn.execute(
+                "SELECT * FROM exception_audit_log WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+
+            transfer_chain = []
+            transfer_chain.append({
+                "handler": t["initiator"],
+                "handler_role": t["initiator_role"],
+                "action": "初始责任人",
+                "at": t["created_at"],
+            })
+            for tr in transfers:
+                transfer_chain.append({
+                    "from_handler": tr["from_handler"],
+                    "from_handler_role": tr["from_handler_role"],
+                    "to_handler": tr["to_handler"],
+                    "to_handler_role": tr["to_handler_role"],
+                    "transferred_by": tr["transferred_by"],
+                    "transferred_role": tr["transferred_role"],
+                    "transfer_reason": tr["transfer_reason"],
+                    "at": tr["created_at"],
+                })
+            transfer_chain.append({
+                "handler": t["current_handler"],
+                "handler_role": t["current_handler_role"],
+                "action": "当前责任人",
+                "at": t["updated_at"],
+            })
+
+            result_rows.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"],
+                "box_code": t["box_code"],
+                "reason_category": t["reason_category"],
+                "description": t["description"],
+                "status": t["status"],
+                "conclusion": t["conclusion"],
+                "allow_proxy_record_at_create": bool(t["allow_proxy_record_at_create"]),
+                "initiator": t["initiator"],
+                "initiator_role": t["initiator_role"],
+                "proxy_recorder": t["proxy_recorder"],
+                "proxy_recorder_role": t["proxy_recorder_role"],
+                "current_handler": t["current_handler"],
+                "current_handler_role": t["current_handler_role"],
+                "created_at": t["created_at"],
+                "updated_at": t["updated_at"],
+                "withdrawn_at": t["withdrawn_at"],
+                "withdrawn_by": t["withdrawn_by"],
+                "withdrawn_reason": t["withdrawn_reason"],
+                "resubmitted_at": t["resubmitted_at"],
+                "resubmitted_by": t["resubmitted_by"],
+                "rejected_at": t["rejected_at"],
+                "rejected_by": t["rejected_by"],
+                "rejected_reason": t["rejected_reason"],
+                "closed_at": t["closed_at"],
+                "closed_by": t["closed_by"],
+                "closed_role": t["closed_role"],
+                "evidence_list": [dict(e) for e in evidence],
+                "transfer_history": [dict(tr) for tr in transfers],
+                "responsibility_chain": transfer_chain,
+                "audit_log": [dict(a) for a in audit],
+            })
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "total_tickets": len(result_rows),
+        "tickets": result_rows,
+    }
+
+
+@app.get("/api/exception/export/csv")
+def export_exception_csv(status: str = None, batch_no: str = None, box_code: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM exception_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        fields = [
+            "ticket_id", "ticket_no", "batch_no", "box_code",
+            "reason_category", "description", "status", "conclusion",
+            "initiator", "initiator_role",
+            "proxy_recorder", "proxy_recorder_role",
+            "current_handler", "current_handler_role",
+            "responsibility_transfers",
+            "created_at", "updated_at",
+            "withdrawn_by", "withdrawn_at", "withdrawn_reason",
+            "rejected_by", "rejected_at", "rejected_reason",
+            "closed_by", "closed_at", "closed_role",
+            "evidence_count",
+        ]
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+
+        for t in tickets:
+            transfers = conn.execute(
+                "SELECT * FROM exception_handler_transfers WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            evidence = conn.execute(
+                "SELECT COUNT(*) as cnt FROM exception_evidence WHERE ticket_id = ?",
+                (t["id"],),
+            ).fetchone()
+
+            transfer_parts = []
+            transfer_parts.append(f"初始:{t['initiator']}({t['initiator_role']})")
+            for tr in transfers:
+                transfer_parts.append(
+                    f"{tr['from_handler']}→{tr['to_handler']}({tr['to_handler_role']})"
+                    f"[{tr['transferred_by']}@{tr['created_at'][:19]}]"
+                )
+            transfer_parts.append(f"当前:{t['current_handler']}({t['current_handler_role']})")
+            transfer_str = " → ".join(transfer_parts)
+
+            row = {
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"] or "",
+                "box_code": t["box_code"] or "",
+                "reason_category": t["reason_category"],
+                "description": t["description"] or "",
+                "status": t["status"],
+                "conclusion": t["conclusion"] or "",
+                "initiator": t["initiator"],
+                "initiator_role": t["initiator_role"] or "",
+                "proxy_recorder": t["proxy_recorder"] or "",
+                "proxy_recorder_role": t["proxy_recorder_role"] or "",
+                "current_handler": t["current_handler"],
+                "current_handler_role": t["current_handler_role"],
+                "responsibility_transfers": transfer_str,
+                "created_at": t["created_at"],
+                "updated_at": t["updated_at"],
+                "withdrawn_by": t["withdrawn_by"] or "",
+                "withdrawn_at": t["withdrawn_at"] or "",
+                "withdrawn_reason": t["withdrawn_reason"] or "",
+                "rejected_by": t["rejected_by"] or "",
+                "rejected_at": t["rejected_at"] or "",
+                "rejected_reason": t["rejected_reason"] or "",
+                "closed_by": t["closed_by"] or "",
+                "closed_at": t["closed_at"] or "",
+                "closed_role": t["closed_role"] or "",
+                "evidence_count": evidence["cnt"],
+            }
+            writer.writerow(row)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=exception_tickets.csv"},
     )

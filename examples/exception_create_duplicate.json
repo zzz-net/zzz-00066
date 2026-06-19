@@ -1,0 +1,8 @@
+{
+  "batch_no": "BATCH-EXC-001",
+  "box_code": "EXC001",
+  "reason_category": "温度异常",
+  "description": "试图重复报单",
+  "role": "库房签收员",
+  "operator": "王五"
+}

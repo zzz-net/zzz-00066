@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-EXC-001",
+  "box_code": "EXC001",
+  "reason_category": "温度异常",
+  "description": "未经授权的代录尝试",
+  "role": "库房签收员",
+  "operator": "王五",
+  "on_behalf_of": "赵六"
+}
