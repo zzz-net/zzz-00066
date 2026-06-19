@@ -1,0 +1,7 @@
+{
+  "target_handler": "钱质控",
+  "target_handler_role": "质控",
+  "transfer_reason": "需质控部门进行专业的温度数据分析和样本有效性评估，判定最终责任",
+  "role": "仓库主管",
+  "operator": "赵主管"
+}

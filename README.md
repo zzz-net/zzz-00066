@@ -775,6 +775,220 @@ python test_exception_comprehensive.py
 
 ---
 
+## 6.7 代录责任追踪单模块
+
+围绕仓内责任追溯场景，**明确分离报单人、代录人、责任岗位、当前处理岗位四个独立字段**，彻底避免姓名与角色串位。支持建单、确认、驳回、撤回、重新提交、补充证据、转交责任人、结案全流程。列表、详情、CSV/JSON 导出均同时展示真实责任人、实际代录人和当前处理岗位。
+
+### 核心设计：四字段分离
+
+| 字段 | 含义 | 普通创建 | 代录创建 |
+|------|------|---------|---------|
+| `reporter` | **报单人**（真实责任人，拥有撤回/重提权限） | operator 本人 | on_behalf_of 指定的员工 |
+| `reporter_role` | **责任岗位**（报单人的岗位角色） | operator 的 role | 代录人角色（可配置） |
+| `proxy_recorder` | **代录人**（代为录入系统的班组长/主管） | null | 代录的 operator |
+| `proxy_recorder_role` | **代录人岗位** | null | 代录人的 role |
+| `current_handler` | **当前处理人**（当前负责处理的责任人） | 报单人（初始值） | 报单人（初始值），转交后更新 |
+| `current_handler_role` | **当前处理岗位** | 报单人角色 | 报单人角色，转交后更新 |
+
+### 状态机
+
+```
+            库房签收员/仓库主管/质控/班组长/库房管理员
+                    创建责任追踪单（班组长/主管/质控可代录）
+                            │
+                            ▼
+                        待处理 ──────── 仓库主管/质控驳回 ────────→ 已驳回
+                     │      │                                       │
+      仓库主管确认：   │      │                                      │ 报单人
+      仓库主管确认    │      │                                      │ 重新提交
+                     │      │                                      │ (补充证据)
+                     ▼      ▼                                       ▼
+                     处理中 ←─────────────────────────────── 待处理
+                  │      │
+       仓库主管/  │      │ 报单人
+       质控结案   │      │ 撤回
+       转交责任人 │      │
+                  ▼      ▼
+                已结案  已撤回
+                          │
+                          │ 报单人重提
+                          ▼
+                        待处理
+```
+
+**角色权限**：
+
+| 动作 | 允许角色 |
+|------|---------|
+| 创建责任追踪单 | 库房签收员、仓库主管、质控、班组长、库房管理员 |
+| 代录责任追踪单 | 班组长、仓库主管、质控（需开启 allow_proxy_record 配置） |
+| 确认/驳回 | 仓库主管、质控 |
+| 补充证据 | 库房签收员、仓库主管、质控、库房管理员 |
+| 转交责任人 | 仓库主管、质控、库房管理员 |
+| 撤回 | **仅报单人本人**（严格按 reporter 精确匹配，同角色不同人不可越权） |
+| 重提（撤回后）| **仅报单人本人** |
+| 重新提交（驳回后）| **仅报单人本人** |
+| 结案 | 仓库主管、质控 |
+
+**原因分类**：`温度异常`、`包装破损`、`数量差异`、`标签错误`、`污染风险`、`设备故障`、`流程违规`、`其他`
+
+**防护规则**：
+
+- **重复报单拦截**：同批次号 + 同箱号 + 同原因分类的活跃（待处理/处理中）工单不可重复创建，409 拦截；重提时排除自身 ID 后检查
+- **撤回后重提责任重置**：转交后被撤回再提交时，`current_handler` 和 `current_handler_role` 重置为报单人及其岗位，不残留上次转交的处理人
+- **配置切换只影响新单**：`allow_proxy_record` 变更仅影响新建工单，已有工单的 `allow_proxy_record_at_create` 冻结不变
+- **越权操作全面拦截**：撤回、重提、重新提交严格校验 `operator == reporter`，同角色不同人一律 403
+- **服务重启状态完整恢复**：所有 5 张表使用 SQLite WAL 模式持久化，`init_db()` 自动重建表结构，重启后状态完整保留
+
+### 代录机制
+
+班组长或主管代一线员工录入时：
+- `reporter` = `on_behalf_of`（被代理人，真实责任人，享有撤回/重提权限）
+- `reporter_role` = 代录人角色（或可配置为被代理人角色）
+- `proxy_recorder` = `operator`（实际代录人）
+- `proxy_recorder_role` = `role`（代录人岗位）
+- `current_handler` = `reporter`（初始处理人为报单人）
+- 代录人**不享有**撤回/重提权限，只有被代理人（报单人）可以操作
+- 未开启 `allow_proxy_record` 时，传入 `on_behalf_of` 会被 403 直接拒绝
+
+### 责任人转交与流转记录
+
+处理中状态下可转交责任人，每次转交都会：
+1. 更新 `current_handler` 和 `current_handler_role`
+2. 向 `liability_handler_transfers` 表写入一条转交记录（含转交原因、转交人、时间）
+3. JSON 导出包含 `responsibility_chain`（完整责任流转链：初始→每次转交→当前）
+4. CSV 导出的 `responsibility_transfers` 字段格式：`初始:报单人(责任岗位)[报单人] → A→B(岗位)[转交人@时间] → ... → 当前:处理人(处理岗位)`
+
+### 按责任岗位筛选
+
+列表和导出均支持双维度岗位筛选：
+- `?reporter_role=` 按**责任岗位**（报单人角色）筛选
+- `?current_handler_role=` 按**当前处理岗位**筛选
+- 可与 `status`、`batch_no`、`box_code` 组合筛选
+
+### 代录责任追踪单 curl 示例
+
+```bash
+# 配置：允许代录
+curl -sS -X POST http://localhost:8000/api/liability/config \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_config_proxy_enabled.json
+
+# 配置：禁止代录
+curl -sS -X POST http://localhost:8000/api/liability/config \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_config_proxy_disabled.json
+
+# 查询配置
+curl -sS http://localhost:8000/api/liability/config
+
+# 库房签收员创建责任追踪单（普通方式）
+curl -sS -X POST http://localhost:8000/api/liability/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_create.json
+
+# 班组长代录责任追踪单（需开启 allow_proxy_record）
+curl -sS -X POST http://localhost:8000/api/liability/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_create_proxy.json
+
+# 代录关闭时代录被拦截（越权代录直接拒绝）
+curl -sS -X POST http://localhost:8000/api/liability/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_create_proxy_blocked.json
+
+# 列出责任追踪单（支持多维度筛选）
+curl -sS "http://localhost:8000/api/liability/tickets"
+curl -sS "http://localhost:8000/api/liability/tickets?status=处理中"
+curl -sS "http://localhost:8000/api/liability/tickets?reporter_role=库房签收员"
+curl -sS "http://localhost:8000/api/liability/tickets?current_handler_role=质控"
+curl -sS "http://localhost:8000/api/liability/tickets?status=已结案&reporter_role=库房签收员"
+
+# 查看工单详情（含证据列表、转交历史、审计日志、责任链）
+curl -sS http://localhost:8000/api/liability/tickets/1
+
+# 仓库主管确认 → 进入处理中
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/confirm \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_confirm.json
+
+# 驳回责任追踪单
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/reject \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_reject.json
+
+# 撤回责任追踪单（仅报单人本人）
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/withdraw \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_withdraw.json
+
+# 重新提交（驳回/撤回后，仅报单人本人，责任自动重置）
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/resubmit \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_resubmit.json
+
+# 补充证据
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/evidence \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_evidence.json
+
+# 转交责任人
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/transfer \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_transfer.json
+
+# 结案（仅仓库主管/质控）
+curl -sS -X POST http://localhost:8000/api/liability/tickets/1/close \
+  -H "Content-Type: application/json" \
+  -d @examples/liability_close.json
+
+# 查看工单审计日志
+curl -sS http://localhost:8000/api/liability/tickets/1/audit
+
+# 查看批次责任汇总
+curl -sS http://localhost:8000/api/liability/batches/BATCH-LIAB-001/summary
+
+# 导出 JSON（支持多维度筛选，含完整责任流转链 responsibility_chain）
+curl -sS "http://localhost:8000/api/liability/export/json"
+curl -sS "http://localhost:8000/api/liability/export/json?status=已结案"
+curl -sS "http://localhost:8000/api/liability/export/json?reporter_role=库房签收员"
+curl -sS "http://localhost:8000/api/liability/export/json?current_handler_role=质控"
+
+# 导出 CSV（含 responsibility_transfers 字段，清晰展示责任流转）
+curl -sS "http://localhost:8000/api/liability/export/csv" -o liability_tickets.csv
+```
+
+### 代录责任追踪单 API 端点一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/liability/config` | 查询代录配置 |
+| `POST` | `/api/liability/config` | 更新代录配置（只影响新工单） |
+| `POST` | `/api/liability/tickets` | 创建责任追踪单（支持代录） |
+| `GET` | `/api/liability/tickets` | 工单列表（`?status=` `?batch_no=` `?box_code=` `?reporter_role=` `?current_handler_role=` 筛选） |
+| `GET` | `/api/liability/tickets/{id}` | 工单详情（含证据、转交历史、审计日志） |
+| `POST` | `/api/liability/tickets/{id}/confirm` | 确认工单（仓库主管/质控） |
+| `POST` | `/api/liability/tickets/{id}/reject` | 驳回工单（仓库主管/质控） |
+| `POST` | `/api/liability/tickets/{id}/withdraw` | 撤回工单（仅报单人本人） |
+| `POST` | `/api/liability/tickets/{id}/resubmit` | 重新提交（仅报单人本人，从驳回/撤回，责任自动重置） |
+| `POST` | `/api/liability/tickets/{id}/evidence` | 补充证据（文字/图片） |
+| `POST` | `/api/liability/tickets/{id}/transfer` | 转交责任人（仓库主管/质控/库房管理员） |
+| `POST` | `/api/liability/tickets/{id}/close` | 结案（仅仓库主管/质控） |
+| `GET` | `/api/liability/tickets/{id}/audit` | 工单审计日志 |
+| `GET` | `/api/liability/batches/{batch_no}/summary` | 批次责任汇总 |
+| `GET` | `/api/liability/export/json` | 导出 JSON（含责任流转链 responsibility_chain） |
+| `GET` | `/api/liability/export/csv` | 导出 CSV（含 responsibility_transfers 字段） |
+
+### 代录责任追踪单回归测试
+
+```bash
+# 覆盖 9 大场景：正常闭环、越权拦截、代录配置切换、撤回重提责任重置、
+# 重复冲突拦截、按责任岗位筛选、导出对账、批次汇总、驳回重提
+python test_liability_comprehensive.py
+```
+
+---
+
 ## 7. 项目结构
 
 ```
@@ -845,3 +1059,4 @@ zzz-00066/
 | 撤回后重提权限校验不严 | 同角色不同人可能越权重开他人工单 | 重提时再次严格校验 `operator == initiator`，同时重新检查重复报单拦截 |
 | 异常单重启丢失 | 处理中状态无法持久化 | 所有表（5张）使用 SQLite WAL 模式持久化，`init_db()` 自动重建表结构，服务重启后状态完整恢复 |
 | 越权操作无拦截 | 同角色不同人可随意操作他人工单 | 撤回/重提/重新提交严格 `operator == initiator`，其他操作按角色白名单控制，越权一律 403 |
+| **转交后撤回重提残留上次处理人** | 重提时未重置 `current_handler`，转交后的处理人会残留下来 | 重提时将 `current_handler` 和 `current_handler_role` 重置为发起人及其角色，责任归属重新判定，审计日志记录重置详情 |

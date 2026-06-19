@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-LIAB-002",
+  "box_code": "LIAB002",
+  "reason_category": "包装破损",
+  "description": "班组长代一线员工录入：外包装严重破损，内部样本可能受影响",
+  "role": "班组长",
+  "operator": "周班长",
+  "on_behalf_of": "张签收"
+}

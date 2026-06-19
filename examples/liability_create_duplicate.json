@@ -1,0 +1,8 @@
+{
+  "batch_no": "BATCH-LIAB-001",
+  "box_code": "LIAB001",
+  "reason_category": "温度异常",
+  "description": "重复报单测试：同箱号同原因的活跃单",
+  "role": "库房管理员",
+  "operator": "陈管理员"
+}

@@ -323,3 +323,68 @@ class ExceptionConfirmRequest(BaseModel):
     role: str
     operator: str
     reason: Optional[str] = None
+
+
+# ── Liability Tracking Ticket (代录责任追踪单) Models ───────────────────────
+
+
+class LiabilityConfigUpdate(BaseModel):
+    allow_proxy_record: bool
+    operator: str
+
+
+class LiabilityTicketCreate(BaseModel):
+    batch_no: Optional[str] = None
+    box_code: Optional[str] = None
+    reason_category: str
+    description: Optional[str] = None
+    role: str
+    operator: str
+    on_behalf_of: Optional[str] = None
+
+
+class LiabilityEvidenceAdd(BaseModel):
+    evidence_type: str = "text"
+    evidence_content: str
+    role: str
+    operator: str
+
+
+class LiabilityTransferRequest(BaseModel):
+    target_handler: str
+    target_handler_role: str
+    transfer_reason: Optional[str] = None
+    role: str
+    operator: str
+
+
+class LiabilityWithdrawRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class LiabilityRejectRequest(BaseModel):
+    role: str
+    operator: str
+    reason: str
+
+
+class LiabilityResubmitRequest(BaseModel):
+    role: str
+    operator: str
+    description: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class LiabilityCloseRequest(BaseModel):
+    role: str
+    operator: str
+    conclusion: str
+    reason: Optional[str] = None
+
+
+class LiabilityConfirmRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None

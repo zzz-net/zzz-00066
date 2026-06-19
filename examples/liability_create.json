@@ -1,0 +1,8 @@
+{
+  "batch_no": "BATCH-LIAB-001",
+  "box_code": "LIAB001",
+  "reason_category": "温度异常",
+  "description": "冷链运输过程中温度超标，需追踪责任归属",
+  "role": "库房签收员",
+  "operator": "张签收"
+}

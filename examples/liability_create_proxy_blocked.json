@@ -1,0 +1,9 @@
+{
+  "batch_no": "BATCH-LIAB-003",
+  "box_code": "LIAB003",
+  "reason_category": "数量差异",
+  "description": "试图在代录关闭时代录创建",
+  "role": "班组长",
+  "operator": "周班长",
+  "on_behalf_of": "张签收"
+}
