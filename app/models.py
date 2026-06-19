@@ -388,3 +388,58 @@ class LiabilityConfirmRequest(BaseModel):
     role: str
     operator: str
     reason: Optional[str] = None
+
+
+# ── Proxy Report Ticket (异常代报受理单) Models ──────────────────────────────
+
+
+class ProxyReportConfigUpdate(BaseModel):
+    allow_proxy_record: bool
+    operator: str
+
+
+class ProxyReportTicketCreate(BaseModel):
+    batch_no: Optional[str] = None
+    box_code: Optional[str] = None
+    reason_category: str
+    description: Optional[str] = None
+    role: str
+    operator: str
+    on_behalf_of: Optional[str] = None
+    on_behalf_of_role: Optional[str] = None
+
+
+class ProxyReportAssignRequest(BaseModel):
+    target_handler: str
+    target_handler_role: str
+    assign_reason: Optional[str] = None
+    role: str
+    operator: str
+
+
+class ProxyReportWithdrawRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class ProxyReportResubmitRequest(BaseModel):
+    role: str
+    operator: str
+    description: Optional[str] = None
+    reason: Optional[str] = None
+    on_behalf_of_role: Optional[str] = None
+
+
+class ProxyReportCloseRequest(BaseModel):
+    role: str
+    operator: str
+    conclusion: str
+    reason: Optional[str] = None
+
+
+class ProxyReportEvidenceAdd(BaseModel):
+    evidence_type: str = "text"
+    evidence_content: str
+    role: str
+    operator: str

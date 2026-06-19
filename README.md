@@ -996,18 +996,26 @@ zzz-00066/
 ├── app/
 │   ├── __init__.py
 │   ├── database.py       # SQLite 连接（WAL + FK）+ 数据库迁移
-│   ├── models.py         # Pydantic 数据模型（含批次相关模型）
+│   ├── models.py         # Pydantic 数据模型（含批次/复核/争议/异常/责任追踪模型）
 │   └── main.py           # 所有路由 + 状态机 + 导出聚合逻辑
 ├── examples/             # curl -d @file 用的请求体样例
 │   ├── threshold_*.json
 │   ├── boxes_*.json / boxes_*.csv
 │   ├── batch_*.json      # 批次相关请求体
-│   └── *.json            # 状态流转请求体
+│   ├── review_*.json     # 复核相关请求体
+│   ├── dispute_*.json    # 争议单相关请求体
+│   ├── exception_*.json  # 仓内异常处置单相关请求体
+│   ├── liability_*.json  # 代录责任追踪单相关请求体
+│   └── *.json            # 其他状态流转请求体
 ├── run_examples.py       # 一键跑完 README 所有链路（跨平台）
 ├── test_api.py           # API 回归测试（24+ 用例）
 ├── test_persistence.py   # 重启持久化回归测试
 ├── test_batch_smoke.py   # 批次功能基础冒烟测试
-├── test_batch_comprehensive.py  # 批次签收全面回归测试（6大场景）
+├── test_batch_comprehensive.py  # 批次签收全面回归测试
+├── test_review_comprehensive.py # 交接复核全面回归测试
+├── test_dispute_comprehensive.py # 争议追责单全面回归测试
+├── test_exception_comprehensive.py # 仓内异常处置单全面回归测试
+├── test_liability_comprehensive.py # 代录责任追踪单全面回归测试
 ├── requirements.txt
 └── README.md
 ```

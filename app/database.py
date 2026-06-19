@@ -448,6 +448,100 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                allow_proxy_record INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT,
+                box_code TEXT,
+                reason_category TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT '待指派',
+                conclusion TEXT,
+                allow_proxy_at_create INTEGER NOT NULL DEFAULT 0,
+                originator TEXT NOT NULL,
+                originator_role TEXT NOT NULL,
+                responsibility_role TEXT NOT NULL,
+                proxy_recorder TEXT,
+                proxy_recorder_role TEXT,
+                current_handler TEXT NOT NULL,
+                current_handler_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL DEFAULT 'text',
+                evidence_content TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                from_handler TEXT NOT NULL,
+                from_handler_role TEXT NOT NULL,
+                to_handler TEXT NOT NULL,
+                to_handler_role TEXT NOT NULL,
+                assigned_by TEXT NOT NULL,
+                assigned_role TEXT NOT NULL,
+                assign_reason TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
         _migrate_db(conn)
 
 
@@ -879,3 +973,147 @@ def _migrate_db(conn):
         )
     except sqlite3.OperationalError:
         pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                allow_proxy_record INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT,
+                box_code TEXT,
+                reason_category TEXT NOT NULL,
+                description TEXT,
+                status TEXT NOT NULL DEFAULT '待指派',
+                conclusion TEXT,
+                allow_proxy_at_create INTEGER NOT NULL DEFAULT 0,
+                originator TEXT NOT NULL,
+                originator_role TEXT NOT NULL,
+                responsibility_role TEXT NOT NULL,
+                proxy_recorder TEXT,
+                proxy_recorder_role TEXT,
+                current_handler TEXT NOT NULL,
+                current_handler_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_type TEXT NOT NULL DEFAULT 'text',
+                evidence_content TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS proxy_report_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                from_handler TEXT NOT NULL,
+                from_handler_role TEXT NOT NULL,
+                to_handler TEXT NOT NULL,
+                to_handler_role TEXT NOT NULL,
+                assigned_by TEXT NOT NULL,
+                assigned_role TEXT NOT NULL,
+                assign_reason TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES proxy_report_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE proxy_report_tickets ADD COLUMN responsibility_role TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+
+def recover_proxy_report_integrity():
+    """服务重启后恢复异常代报受理模块数据完整性"""
+    repaired = 0
+    with get_db() as conn:
+        tickets = conn.execute(
+            "SELECT * FROM proxy_report_tickets WHERE status IN ('待指派', '处理中', '已驳回', '已撤回')"
+        ).fetchall()
+        for t in tickets:
+            need_update = False
+            updates = {}
+            if not t["originator_role"] and t["responsibility_role"]:
+                updates["originator_role"] = t["responsibility_role"]
+                need_update = True
+            if not t["responsibility_role"] and t["originator_role"]:
+                updates["responsibility_role"] = t["originator_role"]
+                need_update = True
+            if not t["current_handler"]:
+                updates["current_handler"] = t["originator"]
+                updates["current_handler_role"] = t["responsibility_role"]
+                need_update = True
+            if need_update:
+                set_clause = ", ".join(f"{k} = ?" for k in updates)
+                params = list(updates.values()) + [t["id"]]
+                conn.execute(
+                    f"UPDATE proxy_report_tickets SET {set_clause} WHERE id = ?",
+                    params
+                )
+                repaired += 1
+    return repaired

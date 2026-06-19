@@ -5,7 +5,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
 
-from app.database import get_db, init_db
+from app.database import get_db, init_db, recover_proxy_report_integrity
 from app.models import (
     BoxImportItem,
     BoxImportJSON,
@@ -48,6 +48,13 @@ from app.models import (
     LiabilityResubmitRequest,
     LiabilityCloseRequest,
     LiabilityConfirmRequest,
+    ProxyReportConfigUpdate,
+    ProxyReportTicketCreate,
+    ProxyReportAssignRequest,
+    ProxyReportWithdrawRequest,
+    ProxyReportResubmitRequest,
+    ProxyReportCloseRequest,
+    ProxyReportEvidenceAdd,
 )
 
 app = FastAPI(title="冷链交接 API")
@@ -129,6 +136,9 @@ VALID_REVIEW_RESULTS = {"通过", "破损", "温控待确认"}
 @app.on_event("startup")
 def startup():
     init_db()
+    repaired = recover_proxy_report_integrity()
+    if repaired > 0:
+        print(f"[ProxyReport] 服务重启后修复了 {repaired} 条异常代报受理单的数据完整性")
 
 
 # ── Thresholds ───────────────────────────────────────────────────────────────
@@ -4792,4 +4802,972 @@ def export_liability_csv(status: str = None, batch_no: str = None, box_code: str
         io.BytesIO(output.getvalue().encode("utf-8-sig")),
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=liability_tickets.csv"},
+    )
+
+
+# ── Proxy Report Ticket (异常代报受理单) Module ─────────────────────────────
+
+PROXY_REPORT_CREATE_ROLES = {"库房签收员", "仓库主管", "质控", "班组长", "库房管理员", "转运员", "出库员"}
+PROXY_REPORT_PROXY_ROLES = {"班组长", "仓库主管", "质控", "库房管理员"}
+PROXY_REPORT_ASSIGN_ROLES = {"仓库主管", "质控"}
+PROXY_REPORT_CLOSE_ROLES = {"仓库主管", "质控"}
+PROXY_REPORT_EVIDENCE_ROLES = {"库房签收员", "仓库主管", "质控", "库房管理员", "班组长"}
+PROXY_REPORT_WITHDRAW_ROLES = PROXY_REPORT_CREATE_ROLES
+
+PROXY_REPORT_STATUSES = {"待指派", "处理中", "已驳回", "已撤回", "已结案"}
+PROXY_REPORT_TERMINAL_STATUSES = {"已结案"}
+PROXY_REPORT_ACTIVE_STATUSES = {"待指派", "处理中"}
+
+PROXY_REPORT_REASON_CATEGORIES = {
+    "温度异常", "包装破损", "数量差异", "标签错误",
+    "污染风险", "设备故障", "流程违规", "其他"
+}
+
+
+def _get_proxy_report_config(conn):
+    row = conn.execute("SELECT * FROM proxy_report_config WHERE id = 1").fetchone()
+    if not row:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO proxy_report_config (id, allow_proxy_record, updated_at, updated_by) VALUES (1, 0, ?, '系统初始化')",
+            (now,),
+        )
+        row = conn.execute("SELECT * FROM proxy_report_config WHERE id = 1").fetchone()
+    return row
+
+
+def _log_proxy_report_audit(conn, ticket_id, action, from_status, to_status,
+                            role, operator, reason, detail, created_at):
+    conn.execute(
+        """
+        INSERT INTO proxy_report_audit_log (ticket_id, action, from_status, to_status,
+                                            role, operator, reason, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticket_id, action, from_status, to_status,
+         role, operator, reason, detail, created_at),
+    )
+
+
+def _get_proxy_report_ticket(conn, ticket_id):
+    return conn.execute(
+        "SELECT * FROM proxy_report_tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()
+
+
+def _build_proxy_report_ticket_detail(conn, ticket):
+    evidence = conn.execute(
+        "SELECT * FROM proxy_report_evidence WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    assignments = conn.execute(
+        "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    audit = conn.execute(
+        "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+
+    responsibility_chain = []
+    responsibility_chain.append({
+        "handler": ticket["originator"],
+        "handler_role": ticket["responsibility_role"],
+        "action": "初始责任人（真实报单人）",
+        "at": ticket["created_at"],
+    })
+    for a in assignments:
+        responsibility_chain.append({
+            "from_handler": a["from_handler"],
+            "from_handler_role": a["from_handler_role"],
+            "to_handler": a["to_handler"],
+            "to_handler_role": a["to_handler_role"],
+            "assigned_by": a["assigned_by"],
+            "assigned_role": a["assigned_role"],
+            "assign_reason": a["assign_reason"],
+            "at": a["created_at"],
+        })
+    responsibility_chain.append({
+        "handler": ticket["current_handler"],
+        "handler_role": ticket["current_handler_role"],
+        "action": "当前责任人（卡住的岗位）",
+        "at": ticket["updated_at"],
+    })
+
+    return {
+        "id": ticket["id"],
+        "ticket_no": ticket["ticket_no"],
+        "batch_no": ticket["batch_no"],
+        "box_code": ticket["box_code"],
+        "reason_category": ticket["reason_category"],
+        "description": ticket["description"],
+        "status": ticket["status"],
+        "conclusion": ticket["conclusion"],
+        "allow_proxy_at_create": bool(ticket["allow_proxy_at_create"]),
+        "originator": ticket["originator"],
+        "originator_role": ticket["originator_role"],
+        "responsibility_role": ticket["responsibility_role"],
+        "proxy_recorder": ticket["proxy_recorder"],
+        "proxy_recorder_role": ticket["proxy_recorder_role"],
+        "current_handler": ticket["current_handler"],
+        "current_handler_role": ticket["current_handler_role"],
+        "created_at": ticket["created_at"],
+        "updated_at": ticket["updated_at"],
+        "withdrawn_at": ticket["withdrawn_at"],
+        "withdrawn_by": ticket["withdrawn_by"],
+        "withdrawn_reason": ticket["withdrawn_reason"],
+        "resubmitted_at": ticket["resubmitted_at"],
+        "resubmitted_by": ticket["resubmitted_by"],
+        "rejected_at": ticket["rejected_at"],
+        "rejected_by": ticket["rejected_by"],
+        "rejected_role": ticket["rejected_role"],
+        "rejected_reason": ticket["rejected_reason"],
+        "closed_at": ticket["closed_at"],
+        "closed_by": ticket["closed_by"],
+        "closed_role": ticket["closed_role"],
+        "evidence_list": [dict(e) for e in evidence],
+        "assignment_history": [dict(a) for a in assignments],
+        "audit_log": [dict(a) for a in audit],
+        "responsibility_chain": responsibility_chain,
+    }
+
+
+def _check_duplicate_proxy_report(conn, batch_no, box_code, reason_category, exclude_ticket_id=None):
+    query = """
+        SELECT * FROM proxy_report_tickets
+        WHERE reason_category = ? AND status IN ('待指派', '处理中')
+    """
+    params = [reason_category]
+    if batch_no:
+        query += " AND batch_no = ?"
+        params.append(batch_no)
+    else:
+        query += " AND batch_no IS NULL"
+    if box_code:
+        query += " AND box_code = ?"
+        params.append(box_code)
+    else:
+        query += " AND box_code IS NULL"
+    if exclude_ticket_id is not None:
+        query += " AND id != ?"
+        params.append(exclude_ticket_id)
+    return conn.execute(query, params).fetchone()
+
+
+@app.get("/api/proxy_report/config")
+def get_proxy_report_config():
+    with get_db() as conn:
+        cfg = _get_proxy_report_config(conn)
+    return {
+        "allow_proxy_record": bool(cfg["allow_proxy_record"]),
+        "updated_at": cfg["updated_at"],
+        "updated_by": cfg["updated_by"],
+    }
+
+
+@app.post("/api/proxy_report/config")
+def update_proxy_report_config(data: ProxyReportConfigUpdate):
+    with get_db() as conn:
+        _get_proxy_report_config(conn)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE proxy_report_config SET allow_proxy_record = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+            (1 if data.allow_proxy_record else 0, now, data.operator),
+        )
+    return {
+        "ok": True,
+        "allow_proxy_record": data.allow_proxy_record,
+    }
+
+
+@app.post("/api/proxy_report/tickets")
+def create_proxy_report_ticket(data: ProxyReportTicketCreate):
+    if data.role not in PROXY_REPORT_CREATE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{data.role}」无权发起异常代报受理单，允许角色: {sorted(PROXY_REPORT_CREATE_ROLES)}",
+        )
+
+    if not data.batch_no and not data.box_code:
+        raise HTTPException(400, "异常代报受理单必须关联批次号或箱号（至少填一个）")
+
+    if data.reason_category not in PROXY_REPORT_REASON_CATEGORIES:
+        raise HTTPException(
+            400,
+            f"原因分类「{data.reason_category}」无效，允许的值: {sorted(PROXY_REPORT_REASON_CATEGORIES)}"
+        )
+
+    is_proxy = data.on_behalf_of is not None and data.on_behalf_of != ""
+
+    with get_db() as conn:
+        cfg = _get_proxy_report_config(conn)
+        allow_proxy = bool(cfg["allow_proxy_record"])
+
+        if is_proxy:
+            if not allow_proxy:
+                raise HTTPException(
+                    403,
+                    "当前配置不允许代录代报，请联系管理员开启 allow_proxy_record 配置",
+                )
+            if data.role not in PROXY_REPORT_PROXY_ROLES:
+                raise HTTPException(
+                    403,
+                    f"角色「{data.role}」无权代录代报异常受理单，允许代报角色: {sorted(PROXY_REPORT_PROXY_ROLES)}",
+                )
+            if not data.on_behalf_of_role or data.on_behalf_of_role.strip() == "":
+                raise HTTPException(
+                    400,
+                    "代录代报时必须指定 on_behalf_of_role（真实报单人的岗位），以便正确判定责任归属",
+                )
+
+        if data.batch_no:
+            batch = conn.execute(
+                "SELECT * FROM batches WHERE batch_no = ?", (data.batch_no,)
+            ).fetchone()
+            if not batch:
+                raise HTTPException(404, f"批次 {data.batch_no} 不存在")
+
+        if data.box_code:
+            box = conn.execute(
+                "SELECT * FROM boxes WHERE box_code = ?", (data.box_code,)
+            ).fetchone()
+            if not box:
+                raise HTTPException(404, f"箱号 {data.box_code} 不存在")
+
+        dup = _check_duplicate_proxy_report(conn, data.batch_no, data.box_code, data.reason_category)
+        if dup:
+            raise HTTPException(
+                409,
+                f"已存在相同箱号/批次+原因分类的未关闭受理单（工单号: {dup['ticket_no']}），请勿重复建单"
+            )
+
+        if is_proxy:
+            originator = data.on_behalf_of
+            originator_role = data.on_behalf_of_role
+            responsibility_role = data.on_behalf_of_role
+            proxy_recorder = data.operator
+            proxy_recorder_role = data.role
+        else:
+            originator = data.operator
+            originator_role = data.role
+            responsibility_role = data.role
+            proxy_recorder = None
+            proxy_recorder_role = None
+
+        current_handler = originator
+        current_handler_role = responsibility_role
+
+        now = datetime.now().isoformat()
+        ticket_no = f"PR-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+        cur = conn.execute(
+            """
+            INSERT INTO proxy_report_tickets (
+                ticket_no, batch_no, box_code, reason_category, description,
+                status, conclusion, allow_proxy_at_create,
+                originator, originator_role, responsibility_role,
+                proxy_recorder, proxy_recorder_role,
+                current_handler, current_handler_role,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, '待指派', NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_no, data.batch_no, data.box_code, data.reason_category,
+             data.description, 1 if allow_proxy else 0,
+             originator, originator_role, responsibility_role,
+             proxy_recorder, proxy_recorder_role,
+             current_handler, current_handler_role,
+             now, now),
+        )
+        ticket_id = cur.lastrowid
+
+        if data.description:
+            conn.execute(
+                """
+                INSERT INTO proxy_report_evidence (ticket_id, evidence_type, evidence_content, added_by, added_role, added_at)
+                VALUES (?, 'text', ?, ?, ?, ?)
+                """,
+                (ticket_id, data.description, data.operator, data.role, now),
+            )
+
+        proxy_detail = ""
+        if is_proxy:
+            proxy_detail = (f"，代录：代填人 {data.operator}（{data.role}），"
+                            f"代真实报单人 {data.on_behalf_of}（{data.on_behalf_of_role}）")
+        _log_proxy_report_audit(
+            conn, ticket_id, "创建异常代报受理单", None, "待指派",
+            data.role, data.operator, data.description,
+            f"原因分类: {data.reason_category}，关联批次: {data.batch_no or '无'}，关联箱号: {data.box_code or '无'}"
+            f"，真实发起人: {originator}（{responsibility_role}），当前卡住岗位: {current_handler_role}"
+            f"{proxy_detail}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "ticket_no": ticket_no,
+        "status": "待指派",
+        "originator": originator,
+        "originator_role": originator_role,
+        "responsibility_role": responsibility_role,
+        "proxy_recorder": proxy_recorder,
+        "proxy_recorder_role": proxy_recorder_role,
+        "current_handler": current_handler,
+        "current_handler_role": current_handler_role,
+        "allow_proxy_at_create": allow_proxy,
+    }
+
+
+@app.get("/api/proxy_report/tickets")
+def list_proxy_report_tickets(
+    status: str = None,
+    batch_no: str = None,
+    box_code: str = None,
+    responsibility_role: str = None,
+    current_handler_role: str = None,
+    originator: str = None,
+    current_handler: str = None,
+):
+    with get_db() as conn:
+        query = "SELECT * FROM proxy_report_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if responsibility_role:
+            conditions.append("responsibility_role = ?")
+            params.append(responsibility_role)
+        if current_handler_role:
+            conditions.append("current_handler_role = ?")
+            params.append(current_handler_role)
+        if originator:
+            conditions.append("originator = ?")
+            params.append(originator)
+        if current_handler:
+            conditions.append("current_handler = ?")
+            params.append(current_handler)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/proxy_report/tickets/{ticket_id}")
+def get_proxy_report_ticket(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+        return _build_proxy_report_ticket_detail(conn, ticket)
+
+
+@app.post("/api/proxy_report/tickets/{ticket_id}/assign")
+def assign_proxy_report_ticket(ticket_id: int, req: ProxyReportAssignRequest):
+    if req.role not in PROXY_REPORT_ASSIGN_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权指派异常受理单责任人，允许角色: {sorted(PROXY_REPORT_ASSIGN_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        if ticket["status"] == "待指派":
+            target_status = "处理中"
+        elif ticket["status"] == "处理中":
+            target_status = "处理中"
+        else:
+            raise HTTPException(
+                409,
+                f"受理单当前状态「{ticket['status']}」不允许指派，仅「待指派」或「处理中」状态可指派"
+            )
+
+        now = datetime.now().isoformat()
+        from_handler = ticket["current_handler"]
+        from_handler_role = ticket["current_handler_role"]
+
+        conn.execute(
+            """
+            UPDATE proxy_report_tickets
+            SET current_handler = ?, current_handler_role = ?,
+                status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (req.target_handler, req.target_handler_role, target_status, now, ticket_id),
+        )
+
+        conn.execute(
+            """
+            INSERT INTO proxy_report_assignments (
+                ticket_id, from_handler, from_handler_role, to_handler, to_handler_role,
+                assigned_by, assigned_role, assign_reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_id, from_handler, from_handler_role,
+             req.target_handler, req.target_handler_role,
+             req.operator, req.role, req.assign_reason, now),
+        )
+
+        _log_proxy_report_audit(
+            conn, ticket_id, "指派责任人", ticket["status"], target_status,
+            req.role, req.operator, req.assign_reason,
+            f"责任人从 {from_handler}（{from_handler_role}）指派至 {req.target_handler}（{req.target_handler_role}），"
+            f"原因: {req.assign_reason or '未说明'}",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": target_status,
+        "from_handler": from_handler,
+        "from_handler_role": from_handler_role,
+        "to_handler": req.target_handler,
+        "to_handler_role": req.target_handler_role,
+    }
+
+
+@app.post("/api/proxy_report/tickets/{ticket_id}/withdraw")
+def withdraw_proxy_report_ticket(ticket_id: int, req: ProxyReportWithdrawRequest):
+    if req.role not in PROXY_REPORT_WITHDRAW_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权撤回异常受理单，允许角色: {sorted(PROXY_REPORT_WITHDRAW_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        if ticket["status"] not in ("待指派", "处理中"):
+            raise HTTPException(
+                409,
+                f"受理单当前状态「{ticket['status']}」不允许撤回，仅「待指派」或「处理中」状态可撤回",
+            )
+
+        if req.operator != ticket["originator"]:
+            raise HTTPException(
+                403,
+                f"仅真实报单人可撤回，当前操作人「{req.operator}」不是发起人「{ticket['originator']}」",
+            )
+
+        now = datetime.now().isoformat()
+        from_status = ticket["status"]
+
+        conn.execute(
+            """
+            UPDATE proxy_report_tickets SET status = '已撤回', updated_at = ?,
+                withdrawn_at = ?, withdrawn_by = ?, withdrawn_reason = ?
+            WHERE id = ?
+            """,
+            (now, now, req.operator, req.reason, ticket_id),
+        )
+
+        _log_proxy_report_audit(
+            conn, ticket_id, "撤回受理单", from_status, "已撤回",
+            req.role, req.operator, req.reason,
+            f"真实报单人撤回受理单，原因: {req.reason or '未说明'}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已撤回",
+        "withdrawn_by": req.operator,
+    }
+
+
+@app.post("/api/proxy_report/tickets/{ticket_id}/resubmit")
+def resubmit_proxy_report_ticket(ticket_id: int, req: ProxyReportResubmitRequest):
+    if req.role not in PROXY_REPORT_WITHDRAW_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权重新上报异常受理单，允许角色: {sorted(PROXY_REPORT_WITHDRAW_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        if ticket["status"] not in ("已驳回", "已撤回"):
+            raise HTTPException(
+                409,
+                f"受理单当前状态「{ticket['status']}」不允许重新上报，仅「已驳回」或「已撤回」状态可重新上报",
+            )
+
+        if req.operator != ticket["originator"]:
+            raise HTTPException(
+                403,
+                f"仅真实报单人可重新上报，当前操作人「{req.operator}」不是发起人「{ticket['originator']}」",
+            )
+
+        dup = _check_duplicate_proxy_report(
+            conn, ticket["batch_no"], ticket["box_code"], ticket["reason_category"],
+            exclude_ticket_id=ticket_id
+        )
+        if dup:
+            raise HTTPException(
+                409,
+                f"已存在相同箱号/批次+原因分类的未关闭受理单（工单号: {dup['ticket_no']}），请勿重复建单"
+            )
+
+        now = datetime.now().isoformat()
+
+        originator = ticket["originator"]
+        responsibility_role = ticket["responsibility_role"]
+        current_handler = originator
+        current_handler_role = responsibility_role
+
+        update_fields = [
+            "status = '待指派'", "updated_at = ?",
+            "rejected_at = NULL", "rejected_by = NULL", "rejected_role = NULL",
+            "rejected_reason = NULL",
+            "withdrawn_at = NULL", "withdrawn_by = NULL", "withdrawn_reason = NULL",
+            "resubmitted_at = ?", "resubmitted_by = ?",
+            "current_handler = ?", "current_handler_role = ?",
+        ]
+        params = [
+            now, now, req.operator,
+            current_handler, current_handler_role,
+        ]
+
+        if req.description:
+            update_fields.append("description = ?")
+            params.append(req.description)
+
+        params.append(ticket_id)
+
+        conn.execute(
+            f"UPDATE proxy_report_tickets SET {', '.join(update_fields)} WHERE id = ?",
+            params,
+        )
+
+        detail_parts = [
+            f"真实报单人重新上报，按真实报单人 {originator}（{responsibility_role}）"
+            f"重新计算责任归属，当前处理人重置为发起人（不沿用代填人或上一位处理人）"
+        ]
+        if req.description:
+            detail_parts.append(f"补充描述: {req.description}")
+
+        _log_proxy_report_audit(
+            conn, ticket_id, "重新上报受理单", ticket["status"], "待指派",
+            req.role, req.operator, req.reason,
+            "；".join(detail_parts), now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "待指派",
+        "originator": originator,
+        "responsibility_role": responsibility_role,
+        "current_handler": current_handler,
+        "current_handler_role": current_handler_role,
+    }
+
+
+@app.post("/api/proxy_report/tickets/{ticket_id}/close")
+def close_proxy_report_ticket(ticket_id: int, req: ProxyReportCloseRequest):
+    if req.role not in PROXY_REPORT_CLOSE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权办结异常受理单，允许角色: {sorted(PROXY_REPORT_CLOSE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        if ticket["status"] != "处理中":
+            raise HTTPException(
+                409,
+                f"受理单当前状态「{ticket['status']}」不允许办结，仅「处理中」状态可办结，"
+                f"需先完成指派",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE proxy_report_tickets SET status = '已结案', updated_at = ?,
+                conclusion = ?, closed_at = ?, closed_by = ?, closed_role = ?
+            WHERE id = ?
+            """,
+            (now, req.conclusion, now, req.operator, req.role, ticket_id),
+        )
+
+        _log_proxy_report_audit(
+            conn, ticket_id, "办结受理单", "处理中", "已结案",
+            req.role, req.operator, req.reason,
+            f"办结结论: {req.conclusion}，责任岗位: {ticket['responsibility_role']}，"
+            f"最终卡住岗位: {ticket['current_handler_role']}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已结案",
+        "conclusion": req.conclusion,
+        "closed_by": req.operator,
+    }
+
+
+@app.post("/api/proxy_report/tickets/{ticket_id}/evidence")
+def add_proxy_report_evidence(ticket_id: int, req: ProxyReportEvidenceAdd):
+    if req.role not in PROXY_REPORT_EVIDENCE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权补充证据，允许角色: {sorted(PROXY_REPORT_EVIDENCE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        if ticket["status"] not in PROXY_REPORT_ACTIVE_STATUSES:
+            raise HTTPException(
+                409,
+                f"受理单当前状态「{ticket['status']}」不允许补充证据，仅「待指派」或「处理中」状态可补充",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO proxy_report_evidence (ticket_id, evidence_type, evidence_content, added_by, added_role, added_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (ticket_id, req.evidence_type, req.evidence_content, req.operator, req.role, now),
+        )
+
+        conn.execute(
+            "UPDATE proxy_report_tickets SET updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+
+        _log_proxy_report_audit(
+            conn, ticket_id, "补充证据", ticket["status"], ticket["status"],
+            req.role, req.operator, None,
+            f"补充证据（{req.evidence_type}）: {req.evidence_content}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "evidence_type": req.evidence_type,
+        "evidence_content": req.evidence_content,
+        "added_by": req.operator,
+    }
+
+
+@app.get("/api/proxy_report/tickets/{ticket_id}/audit")
+def get_proxy_report_audit(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_proxy_report_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"异常代报受理单 {ticket_id} 不存在")
+
+        rows = conn.execute(
+            "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
+            (ticket_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/proxy_report/batches/{batch_no}/summary")
+def get_batch_proxy_report_summary(batch_no: str):
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        tickets = conn.execute(
+            "SELECT * FROM proxy_report_tickets WHERE batch_no = ? ORDER BY created_at DESC",
+            (batch_no,),
+        ).fetchall()
+
+        total = len(tickets)
+        by_status = {}
+        by_category = {}
+        by_responsibility_role = {}
+        by_current_handler_role = {}
+        for t in tickets:
+            s = t["status"]
+            by_status[s] = by_status.get(s, 0) + 1
+            c = t["reason_category"]
+            by_category[c] = by_category.get(c, 0) + 1
+            rr = t["responsibility_role"]
+            by_responsibility_role[rr] = by_responsibility_role.get(rr, 0) + 1
+            ch = t["current_handler_role"]
+            by_current_handler_role[ch] = by_current_handler_role.get(ch, 0) + 1
+
+        ticket_summaries = []
+        for t in tickets:
+            ticket_summaries.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "status": t["status"],
+                "reason_category": t["reason_category"],
+                "box_code": t["box_code"],
+                "originator": t["originator"],
+                "responsibility_role": t["responsibility_role"],
+                "proxy_recorder": t["proxy_recorder"],
+                "current_handler": t["current_handler"],
+                "current_handler_role": t["current_handler_role"],
+                "created_at": t["created_at"],
+                "conclusion": t["conclusion"],
+            })
+
+    return {
+        "batch_no": batch_no,
+        "batch_status": batch["status"],
+        "total_tickets": total,
+        "by_status": by_status,
+        "by_category": by_category,
+        "by_responsibility_role": by_responsibility_role,
+        "by_current_handler_role": by_current_handler_role,
+        "tickets": ticket_summaries,
+    }
+
+
+@app.get("/api/proxy_report/export/json")
+def export_proxy_report_json(
+    status: str = None,
+    batch_no: str = None,
+    box_code: str = None,
+    responsibility_role: str = None,
+    current_handler_role: str = None,
+):
+    with get_db() as conn:
+        query = "SELECT * FROM proxy_report_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if responsibility_role:
+            conditions.append("responsibility_role = ?")
+            params.append(responsibility_role)
+        if current_handler_role:
+            conditions.append("current_handler_role = ?")
+            params.append(current_handler_role)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        result_rows = []
+        for t in tickets:
+            evidence = conn.execute(
+                "SELECT * FROM proxy_report_evidence WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            assignments = conn.execute(
+                "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            audit = conn.execute(
+                "SELECT * FROM proxy_report_audit_log WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+
+            responsibility_chain = []
+            responsibility_chain.append({
+                "handler": t["originator"],
+                "handler_role": t["responsibility_role"],
+                "action": "初始责任人（真实报单人）",
+                "at": t["created_at"],
+            })
+            for a in assignments:
+                responsibility_chain.append({
+                    "from_handler": a["from_handler"],
+                    "from_handler_role": a["from_handler_role"],
+                    "to_handler": a["to_handler"],
+                    "to_handler_role": a["to_handler_role"],
+                    "assigned_by": a["assigned_by"],
+                    "assigned_role": a["assigned_role"],
+                    "assign_reason": a["assign_reason"],
+                    "at": a["created_at"],
+                })
+            responsibility_chain.append({
+                "handler": t["current_handler"],
+                "handler_role": t["current_handler_role"],
+                "action": "当前责任人（卡住的岗位）",
+                "at": t["updated_at"],
+            })
+
+            result_rows.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"],
+                "box_code": t["box_code"],
+                "reason_category": t["reason_category"],
+                "description": t["description"],
+                "status": t["status"],
+                "conclusion": t["conclusion"],
+                "allow_proxy_at_create": bool(t["allow_proxy_at_create"]),
+                "originator": t["originator"],
+                "originator_role": t["originator_role"],
+                "responsibility_role": t["responsibility_role"],
+                "proxy_recorder": t["proxy_recorder"],
+                "proxy_recorder_role": t["proxy_recorder_role"],
+                "current_handler": t["current_handler"],
+                "current_handler_role": t["current_handler_role"],
+                "created_at": t["created_at"],
+                "updated_at": t["updated_at"],
+                "withdrawn_at": t["withdrawn_at"],
+                "withdrawn_by": t["withdrawn_by"],
+                "withdrawn_reason": t["withdrawn_reason"],
+                "resubmitted_at": t["resubmitted_at"],
+                "resubmitted_by": t["resubmitted_by"],
+                "rejected_at": t["rejected_at"],
+                "rejected_by": t["rejected_by"],
+                "rejected_reason": t["rejected_reason"],
+                "closed_at": t["closed_at"],
+                "closed_by": t["closed_by"],
+                "closed_role": t["closed_role"],
+                "evidence_list": [dict(e) for e in evidence],
+                "assignment_history": [dict(a) for a in assignments],
+                "responsibility_chain": responsibility_chain,
+                "audit_log": [dict(a) for a in audit],
+            })
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "total_tickets": len(result_rows),
+        "tickets": result_rows,
+    }
+
+
+@app.get("/api/proxy_report/export/csv")
+def export_proxy_report_csv(
+    status: str = None,
+    batch_no: str = None,
+    box_code: str = None,
+    responsibility_role: str = None,
+    current_handler_role: str = None,
+):
+    with get_db() as conn:
+        query = "SELECT * FROM proxy_report_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if box_code:
+            conditions.append("box_code = ?")
+            params.append(box_code)
+        if responsibility_role:
+            conditions.append("responsibility_role = ?")
+            params.append(responsibility_role)
+        if current_handler_role:
+            conditions.append("current_handler_role = ?")
+            params.append(current_handler_role)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        fields = [
+            "ticket_id", "ticket_no", "batch_no", "box_code",
+            "reason_category", "description", "status", "conclusion",
+            "originator", "originator_role",
+            "responsibility_role",
+            "proxy_recorder", "proxy_recorder_role",
+            "current_handler", "current_handler_role",
+            "responsibility_chain_text",
+            "allow_proxy_at_create",
+            "created_at", "updated_at",
+            "withdrawn_by", "withdrawn_at", "withdrawn_reason",
+            "resubmitted_by", "resubmitted_at",
+            "closed_by", "closed_at", "closed_role",
+            "evidence_count",
+        ]
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+
+        for t in tickets:
+            assignments = conn.execute(
+                "SELECT * FROM proxy_report_assignments WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            evidence = conn.execute(
+                "SELECT COUNT(*) as cnt FROM proxy_report_evidence WHERE ticket_id = ?",
+                (t["id"],),
+            ).fetchone()
+
+            chain_parts = []
+            chain_parts.append(f"[发起]{t['originator']}({t['responsibility_role']})")
+            for a in assignments:
+                chain_parts.append(
+                    f"[指派]{a['from_handler']}({a['from_handler_role']})"
+                    f"→{a['to_handler']}({a['to_handler_role']})"
+                    f"[{a['assigned_by']}@{a['created_at'][:19]}]"
+                )
+            chain_parts.append(f"[当前卡住]{t['current_handler']}({t['current_handler_role']})")
+            chain_str = " → ".join(chain_parts)
+
+            row = {
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"] or "",
+                "box_code": t["box_code"] or "",
+                "reason_category": t["reason_category"],
+                "description": t["description"] or "",
+                "status": t["status"],
+                "conclusion": t["conclusion"] or "",
+                "originator": t["originator"],
+                "originator_role": t["originator_role"] or "",
+                "responsibility_role": t["responsibility_role"],
+                "proxy_recorder": t["proxy_recorder"] or "",
+                "proxy_recorder_role": t["proxy_recorder_role"] or "",
+                "current_handler": t["current_handler"],
+                "current_handler_role": t["current_handler_role"],
+                "responsibility_chain_text": chain_str,
+                "allow_proxy_at_create": bool(t["allow_proxy_at_create"]),
+                "created_at": t["created_at"],
+                "updated_at": t["updated_at"],
+                "withdrawn_by": t["withdrawn_by"] or "",
+                "withdrawn_at": t["withdrawn_at"] or "",
+                "withdrawn_reason": t["withdrawn_reason"] or "",
+                "resubmitted_by": t["resubmitted_by"] or "",
+                "resubmitted_at": t["resubmitted_at"] or "",
+                "closed_by": t["closed_by"] or "",
+                "closed_at": t["closed_at"] or "",
+                "closed_role": t["closed_role"] or "",
+                "evidence_count": evidence["cnt"],
+            }
+            writer.writerow(row)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=proxy_report_tickets.csv"},
     )
