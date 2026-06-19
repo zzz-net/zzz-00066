@@ -1,0 +1,8 @@
+{
+  "batch_no": "BATCH-DSP-001",
+  "box_codes": ["DV001"],
+  "problem_type": "外包装破损",
+  "evidence_desc": "箱子外包装有撕裂",
+  "role": "出库员",
+  "operator": "张三"
+}

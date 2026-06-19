@@ -21,6 +21,15 @@ from app.models import (
     ReviewBoxRequest,
     ReviewCancelRequest,
     ArchiveRequest,
+    DisputeConfigUpdate,
+    DisputeTicketCreate,
+    DisputeConfirmRequest,
+    DisputeRejectRequest,
+    DisputeWithdrawRequest,
+    DisputeReopenRequest,
+    DisputeResubmitRequest,
+    DisputeCloseRequest,
+    DisputeEvidenceRequest,
 )
 
 app = FastAPI(title="冷链交接 API")
@@ -2009,3 +2018,835 @@ def archive_batch(batch_no: str, req: ArchiveRequest):
         "archived_at": now,
         "archived_by": req.operator,
     }
+
+
+# ── Dispute Accountability Module ────────────────────────────────────────────
+
+DISPUTE_CREATE_ROLES = {"库房签收员", "仓库主管", "质控"}
+DISPUTE_CONFIRM_ROLES = {"仓库主管", "质控"}
+DISPUTE_CLOSE_ROLES = {"仓库主管", "质控"}
+DISPUTE_EVIDENCE_ROLES = {"库房签收员", "仓库主管", "质控"}
+DISPUTE_STATUSES = {"待确认", "处理中", "已驳回", "已撤回", "已结案"}
+DISPUTE_TERMINAL_STATUSES = {"已结案"}
+DISPUTE_ACTIVE_STATUSES = {"待确认", "处理中"}
+
+
+def _get_dispute_config(conn):
+    row = conn.execute("SELECT * FROM dispute_config WHERE id = 1").fetchone()
+    if not row:
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO dispute_config (id, require_double_confirm, updated_at, updated_by) VALUES (1, 0, ?, '系统初始化')",
+            (now,),
+        )
+        row = conn.execute("SELECT * FROM dispute_config WHERE id = 1").fetchone()
+    return row
+
+
+def _log_dispute_audit(conn, ticket_id, action, from_status, to_status,
+                       role, operator, reason, detail, created_at):
+    conn.execute(
+        """
+        INSERT INTO dispute_audit_log (ticket_id, action, from_status, to_status,
+                                       role, operator, reason, detail, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (ticket_id, action, from_status, to_status,
+         role, operator, reason, detail, created_at),
+    )
+
+
+def _get_dispute_ticket(conn, ticket_id):
+    return conn.execute(
+        "SELECT * FROM dispute_tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()
+
+
+def _build_ticket_detail(conn, ticket):
+    boxes = conn.execute(
+        "SELECT * FROM dispute_ticket_boxes WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    evidence = conn.execute(
+        "SELECT * FROM dispute_evidence WHERE ticket_id = ? ORDER BY id",
+        (ticket["id"],),
+    ).fetchall()
+    return {
+        "id": ticket["id"],
+        "ticket_no": ticket["ticket_no"],
+        "batch_no": ticket["batch_no"],
+        "status": ticket["status"],
+        "problem_type": ticket["problem_type"],
+        "evidence_desc": ticket["evidence_desc"],
+        "responsibility_judgment": ticket["responsibility_judgment"],
+        "deadline": ticket["deadline"],
+        "conclusion": ticket["conclusion"],
+        "require_double_confirm": bool(ticket["require_double_confirm"]),
+        "created_by": ticket["created_by"],
+        "created_role": ticket["created_role"],
+        "created_at": ticket["created_at"],
+        "updated_at": ticket["updated_at"],
+        "supervisor_confirmed": bool(ticket["supervisor_confirmed"]),
+        "supervisor_confirmed_by": ticket["supervisor_confirmed_by"],
+        "supervisor_confirmed_at": ticket["supervisor_confirmed_at"],
+        "qc_confirmed": bool(ticket["qc_confirmed"]),
+        "qc_confirmed_by": ticket["qc_confirmed_by"],
+        "qc_confirmed_at": ticket["qc_confirmed_at"],
+        "rejected_at": ticket["rejected_at"],
+        "rejected_by": ticket["rejected_by"],
+        "rejected_role": ticket["rejected_role"],
+        "rejected_reason": ticket["rejected_reason"],
+        "withdrawn_at": ticket["withdrawn_at"],
+        "withdrawn_by": ticket["withdrawn_by"],
+        "withdrawn_reason": ticket["withdrawn_reason"],
+        "resubmitted_at": ticket["resubmitted_at"],
+        "resubmitted_by": ticket["resubmitted_by"],
+        "closed_at": ticket["closed_at"],
+        "closed_by": ticket["closed_by"],
+        "closed_role": ticket["closed_role"],
+        "boxes": [dict(b) for b in boxes],
+        "evidence_list": [dict(e) for e in evidence],
+    }
+
+
+@app.get("/api/dispute/config")
+def get_dispute_config():
+    with get_db() as conn:
+        cfg = _get_dispute_config(conn)
+    return {
+        "require_double_confirm": bool(cfg["require_double_confirm"]),
+        "updated_at": cfg["updated_at"],
+        "updated_by": cfg["updated_by"],
+    }
+
+
+@app.post("/api/dispute/config")
+def update_dispute_config(data: DisputeConfigUpdate):
+    with get_db() as conn:
+        _get_dispute_config(conn)
+        now = datetime.now().isoformat()
+        conn.execute(
+            "UPDATE dispute_config SET require_double_confirm = ?, updated_at = ?, updated_by = ? WHERE id = 1",
+            (1 if data.require_double_confirm else 0, now, data.operator),
+        )
+    return {
+        "ok": True,
+        "require_double_confirm": data.require_double_confirm,
+    }
+
+
+@app.post("/api/dispute/tickets")
+def create_dispute_ticket(data: DisputeTicketCreate):
+    if data.role not in DISPUTE_CREATE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{data.role}」无权发起争议单，允许角色: {sorted(DISPUTE_CREATE_ROLES)}",
+        )
+
+    if not data.box_codes:
+        raise HTTPException(400, "争议单必须关联至少一个箱号")
+
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (data.batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {data.batch_no} 不存在")
+
+        if batch["status"] not in ("已签收", "已归档"):
+            raise HTTPException(
+                409,
+                f"批次 {data.batch_no} 当前状态「{batch['status']}」不允许发起争议单，仅限已签收或已归档批次",
+            )
+
+        active_ticket = conn.execute(
+            "SELECT * FROM dispute_tickets WHERE batch_no = ? AND status IN ('待确认', '处理中')",
+            (data.batch_no,),
+        ).fetchone()
+        if active_ticket:
+            raise HTTPException(
+                409,
+                f"批次 {data.batch_no} 已有进行中的争议单（工单号: {active_ticket['ticket_no']}），请先处理完成后再发起新争议单",
+            )
+
+        batch_box_rows = conn.execute(
+            """
+            SELECT bb.box_code FROM batch_boxes bb
+            JOIN boxes b ON bb.box_code = b.box_code
+            WHERE bb.batch_no = ? AND b.status = '已签收'
+            """,
+            (data.batch_no,),
+        ).fetchall()
+        batch_box_codes = {r["box_code"] for r in batch_box_rows}
+
+        for bc in data.box_codes:
+            if bc not in batch_box_codes:
+                raise HTTPException(
+                    400,
+                    f"箱号 {bc} 不在批次 {data.batch_no} 的已签收箱子中，不允许跨批次混填",
+                )
+
+        cfg = _get_dispute_config(conn)
+        require_double = bool(cfg["require_double_confirm"])
+
+        now = datetime.now().isoformat()
+        ticket_no = f"DSP-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+
+        cur = conn.execute(
+            """
+            INSERT INTO dispute_tickets (ticket_no, batch_no, status, problem_type,
+                evidence_desc, responsibility_judgment, deadline, conclusion,
+                require_double_confirm, created_by, created_role, created_at, updated_at)
+            VALUES (?, ?, '待确认', ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+            """,
+            (ticket_no, data.batch_no, data.problem_type,
+             data.evidence_desc, data.responsibility_judgment,
+             data.deadline, 1 if require_double else 0,
+             data.operator, data.role, now, now),
+        )
+        ticket_id = cur.lastrowid
+
+        for bc in data.box_codes:
+            conn.execute(
+                "INSERT INTO dispute_ticket_boxes (ticket_id, box_code) VALUES (?, ?)",
+                (ticket_id, bc),
+            )
+
+        if data.evidence_desc:
+            conn.execute(
+                """
+                INSERT INTO dispute_evidence (ticket_id, evidence_desc, added_by, added_role, added_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (ticket_id, data.evidence_desc, data.operator, data.role, now),
+            )
+
+        _log_dispute_audit(
+            conn, ticket_id, "创建争议单", None, "待确认",
+            data.role, data.operator, data.evidence_desc,
+            f"关联批次 {data.batch_no}，{len(data.box_codes)} 箱，问题类型: {data.problem_type}，"
+            f"{'双确认' if require_double else '单确认'}模式",
+            now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "ticket_no": ticket_no,
+        "status": "待确认",
+        "require_double_confirm": require_double,
+    }
+
+
+@app.get("/api/dispute/tickets")
+def list_dispute_tickets(status: str = None, batch_no: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM dispute_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/dispute/tickets/{ticket_id}")
+def get_dispute_ticket(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+        return _build_ticket_detail(conn, ticket)
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/confirm")
+def confirm_dispute_ticket(ticket_id: int, req: DisputeConfirmRequest):
+    if req.role not in DISPUTE_CONFIRM_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权确认争议单，允许角色: {sorted(DISPUTE_CONFIRM_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "待确认":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许确认，仅「待确认」状态可确认",
+            )
+
+        now = datetime.now().isoformat()
+        require_double = bool(ticket["require_double_confirm"])
+
+        if require_double:
+            if req.role == "仓库主管":
+                if ticket["supervisor_confirmed"]:
+                    raise HTTPException(409, "仓库主管已确认，不可重复确认")
+                conn.execute(
+                    """
+                    UPDATE dispute_tickets SET supervisor_confirmed = 1,
+                        supervisor_confirmed_by = ?, supervisor_confirmed_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (req.operator, now, now, ticket_id),
+                )
+                _log_dispute_audit(
+                    conn, ticket_id, "仓库主管确认", "待确认", "待确认",
+                    req.role, req.operator, req.reason,
+                    "仓库主管已确认，等待质控确认", now,
+                )
+                qc_done = bool(ticket["qc_confirmed"])
+                if qc_done:
+                    conn.execute(
+                        "UPDATE dispute_tickets SET status = '处理中', updated_at = ? WHERE id = ?",
+                        (now, ticket_id),
+                    )
+                    _log_dispute_audit(
+                        conn, ticket_id, "双确认完成", "待确认", "处理中",
+                        req.role, req.operator, req.reason,
+                        "仓库主管与质控均已确认，工单进入处理中", now,
+                    )
+            elif req.role == "质控":
+                if ticket["qc_confirmed"]:
+                    raise HTTPException(409, "质控已确认，不可重复确认")
+                conn.execute(
+                    """
+                    UPDATE dispute_tickets SET qc_confirmed = 1,
+                        qc_confirmed_by = ?, qc_confirmed_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (req.operator, now, now, ticket_id),
+                )
+                _log_dispute_audit(
+                    conn, ticket_id, "质控确认", "待确认", "待确认",
+                    req.role, req.operator, req.reason,
+                    "质控已确认，等待仓库主管确认", now,
+                )
+                supervisor_done = bool(ticket["supervisor_confirmed"])
+                if supervisor_done:
+                    conn.execute(
+                        "UPDATE dispute_tickets SET status = '处理中', updated_at = ? WHERE id = ?",
+                        (now, ticket_id),
+                    )
+                    _log_dispute_audit(
+                        conn, ticket_id, "双确认完成", "待确认", "处理中",
+                        req.role, req.operator, req.reason,
+                        "仓库主管与质控均已确认，工单进入处理中", now,
+                    )
+        else:
+            if req.role != "仓库主管":
+                raise HTTPException(
+                    403,
+                    f"单确认模式下仅仓库主管可确认，角色「{req.role}」无权确认",
+                )
+            conn.execute(
+                "UPDATE dispute_tickets SET status = '处理中', updated_at = ?, "
+                "supervisor_confirmed = 1, supervisor_confirmed_by = ?, supervisor_confirmed_at = ? "
+                "WHERE id = ?",
+                (now, req.operator, now, ticket_id),
+            )
+            _log_dispute_audit(
+                conn, ticket_id, "确认争议单", "待确认", "处理中",
+                req.role, req.operator, req.reason,
+                "仓库主管确认，工单进入处理中", now,
+            )
+
+        ticket = _get_dispute_ticket(conn, ticket_id)
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": ticket["status"],
+        "supervisor_confirmed": bool(ticket["supervisor_confirmed"]),
+        "qc_confirmed": bool(ticket["qc_confirmed"]),
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/reject")
+def reject_dispute_ticket(ticket_id: int, req: DisputeRejectRequest):
+    if req.role not in DISPUTE_CONFIRM_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权驳回争议单，允许角色: {sorted(DISPUTE_CONFIRM_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "待确认":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许驳回，仅「待确认」状态可驳回",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE dispute_tickets SET status = '已驳回', updated_at = ?,
+                rejected_at = ?, rejected_by = ?, rejected_role = ?, rejected_reason = ?
+            WHERE id = ?
+            """,
+            (now, now, req.operator, req.role, req.reason, ticket_id),
+        )
+
+        _log_dispute_audit(
+            conn, ticket_id, "驳回争议单", "待确认", "已驳回",
+            req.role, req.operator, req.reason,
+            f"驳回原因: {req.reason}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已驳回",
+        "rejected_by": req.operator,
+        "rejected_reason": req.reason,
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/withdraw")
+def withdraw_dispute_ticket(ticket_id: int, req: DisputeWithdrawRequest):
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "处理中":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许撤回，仅「处理中」状态可撤回",
+            )
+
+        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+            raise HTTPException(
+                403,
+                f"仅工单创建人可撤回，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE dispute_tickets SET status = '已撤回', updated_at = ?,
+                withdrawn_at = ?, withdrawn_by = ?, withdrawn_reason = ?
+            WHERE id = ?
+            """,
+            (now, now, req.operator, req.reason, ticket_id),
+        )
+
+        _log_dispute_audit(
+            conn, ticket_id, "撤回争议单", "处理中", "已撤回",
+            req.role, req.operator, req.reason,
+            "创建人撤回争议单", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已撤回",
+        "withdrawn_by": req.operator,
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/reopen")
+def reopen_dispute_ticket(ticket_id: int, req: DisputeReopenRequest):
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "已撤回":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许重开，仅「已撤回」状态可重开",
+            )
+
+        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+            raise HTTPException(
+                403,
+                f"仅工单创建人可重开，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE dispute_tickets SET status = '待确认', updated_at = ?,
+                supervisor_confirmed = 0, supervisor_confirmed_by = NULL,
+                supervisor_confirmed_at = NULL,
+                qc_confirmed = 0, qc_confirmed_by = NULL, qc_confirmed_at = NULL,
+                withdrawn_at = NULL, withdrawn_by = NULL, withdrawn_reason = NULL
+            WHERE id = ?
+            """,
+            (now, ticket_id),
+        )
+
+        _log_dispute_audit(
+            conn, ticket_id, "重开争议单", "已撤回", "待确认",
+            req.role, req.operator, req.reason,
+            "创建人重开争议单，重新进入待确认", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "待确认",
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/resubmit")
+def resubmit_dispute_ticket(ticket_id: int, req: DisputeResubmitRequest):
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "已驳回":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许重新提交，仅「已驳回」状态可重新提交",
+            )
+
+        if req.operator != ticket["created_by"] and req.role != ticket["created_role"]:
+            raise HTTPException(
+                403,
+                f"仅工单创建人可重新提交，当前操作人「{req.operator}」不是创建人「{ticket['created_by']}」",
+            )
+
+        now = datetime.now().isoformat()
+
+        update_fields = [
+            "status = '待确认'", "updated_at = ?",
+            "supervisor_confirmed = 0", "supervisor_confirmed_by = NULL",
+            "supervisor_confirmed_at = NULL",
+            "qc_confirmed = 0", "qc_confirmed_by = NULL", "qc_confirmed_at = NULL",
+            "rejected_at = NULL", "rejected_by = NULL", "rejected_role = NULL",
+            "rejected_reason = NULL",
+            "resubmitted_at = ?", "resubmitted_by = ?",
+        ]
+        params = [now, now, req.operator]
+
+        if req.evidence_desc:
+            update_fields.append("evidence_desc = ?")
+            params.append(req.evidence_desc)
+
+        params.append(ticket_id)
+
+        conn.execute(
+            f"UPDATE dispute_tickets SET {', '.join(update_fields)} WHERE id = ?",
+            params,
+        )
+
+        detail_parts = ["创建人重新提交争议单"]
+        if req.evidence_desc:
+            detail_parts.append(f"补充证据说明: {req.evidence_desc}")
+
+        _log_dispute_audit(
+            conn, ticket_id, "重新提交争议单", "已驳回", "待确认",
+            req.role, req.operator, req.reason,
+            "；".join(detail_parts), now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "待确认",
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/close")
+def close_dispute_ticket(ticket_id: int, req: DisputeCloseRequest):
+    if req.role not in DISPUTE_CLOSE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权结案争议单，允许角色: {sorted(DISPUTE_CLOSE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] != "处理中":
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许结案，仅「处理中」状态可结案",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            UPDATE dispute_tickets SET status = '已结案', updated_at = ?,
+                conclusion = ?, closed_at = ?, closed_by = ?, closed_role = ?
+            WHERE id = ?
+            """,
+            (now, req.conclusion, now, req.operator, req.role, ticket_id),
+        )
+
+        _log_dispute_audit(
+            conn, ticket_id, "结案争议单", "处理中", "已结案",
+            req.role, req.operator, req.reason,
+            f"结案结论: {req.conclusion}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "status": "已结案",
+        "conclusion": req.conclusion,
+        "closed_by": req.operator,
+    }
+
+
+@app.post("/api/dispute/tickets/{ticket_id}/evidence")
+def add_dispute_evidence(ticket_id: int, req: DisputeEvidenceRequest):
+    if req.role not in DISPUTE_EVIDENCE_ROLES:
+        raise HTTPException(
+            403,
+            f"角色「{req.role}」无权补充证据，允许角色: {sorted(DISPUTE_EVIDENCE_ROLES)}",
+        )
+
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        if ticket["status"] not in DISPUTE_ACTIVE_STATUSES:
+            raise HTTPException(
+                409,
+                f"争议工单当前状态「{ticket['status']}」不允许补充证据，仅「待确认」或「处理中」状态可补充",
+            )
+
+        now = datetime.now().isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO dispute_evidence (ticket_id, evidence_desc, added_by, added_role, added_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (ticket_id, req.evidence_desc, req.operator, req.role, now),
+        )
+
+        conn.execute(
+            "UPDATE dispute_tickets SET updated_at = ? WHERE id = ?",
+            (now, ticket_id),
+        )
+
+        _log_dispute_audit(
+            conn, ticket_id, "补充证据", ticket["status"], ticket["status"],
+            req.role, req.operator, None,
+            f"补充证据: {req.evidence_desc}", now,
+        )
+
+    return {
+        "ok": True,
+        "ticket_id": ticket_id,
+        "evidence_desc": req.evidence_desc,
+        "added_by": req.operator,
+    }
+
+
+@app.get("/api/dispute/tickets/{ticket_id}/audit")
+def get_dispute_audit(ticket_id: int):
+    with get_db() as conn:
+        ticket = _get_dispute_ticket(conn, ticket_id)
+        if not ticket:
+            raise HTTPException(404, f"争议工单 {ticket_id} 不存在")
+
+        rows = conn.execute(
+            "SELECT * FROM dispute_audit_log WHERE ticket_id = ? ORDER BY id",
+            (ticket_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/dispute/batches/{batch_no}/summary")
+def get_batch_dispute_summary(batch_no: str):
+    with get_db() as conn:
+        batch = conn.execute(
+            "SELECT * FROM batches WHERE batch_no = ?", (batch_no,)
+        ).fetchone()
+        if not batch:
+            raise HTTPException(404, f"批次 {batch_no} 不存在")
+
+        tickets = conn.execute(
+            "SELECT * FROM dispute_tickets WHERE batch_no = ? ORDER BY created_at DESC",
+            (batch_no,),
+        ).fetchall()
+
+        total = len(tickets)
+        by_status = {}
+        for t in tickets:
+            s = t["status"]
+            by_status[s] = by_status.get(s, 0) + 1
+
+        ticket_summaries = []
+        for t in tickets:
+            boxes = conn.execute(
+                "SELECT box_code FROM dispute_ticket_boxes WHERE ticket_id = ?",
+                (t["id"],),
+            ).fetchall()
+            ticket_summaries.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "status": t["status"],
+                "problem_type": t["problem_type"],
+                "created_by": t["created_by"],
+                "created_at": t["created_at"],
+                "box_codes": [b["box_code"] for b in boxes],
+                "conclusion": t["conclusion"],
+            })
+
+    return {
+        "batch_no": batch_no,
+        "batch_status": batch["status"],
+        "total_tickets": total,
+        "by_status": by_status,
+        "tickets": ticket_summaries,
+    }
+
+
+@app.get("/api/dispute/export/json")
+def export_dispute_json(status: str = None, batch_no: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM dispute_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        result_rows = []
+        for t in tickets:
+            boxes = conn.execute(
+                "SELECT box_code FROM dispute_ticket_boxes WHERE ticket_id = ?",
+                (t["id"],),
+            ).fetchall()
+            evidence = conn.execute(
+                "SELECT * FROM dispute_evidence WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+            audit = conn.execute(
+                "SELECT * FROM dispute_audit_log WHERE ticket_id = ? ORDER BY id",
+                (t["id"],),
+            ).fetchall()
+
+            result_rows.append({
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"],
+                "status": t["status"],
+                "problem_type": t["problem_type"],
+                "evidence_desc": t["evidence_desc"],
+                "responsibility_judgment": t["responsibility_judgment"],
+                "deadline": t["deadline"],
+                "conclusion": t["conclusion"],
+                "require_double_confirm": bool(t["require_double_confirm"]),
+                "created_by": t["created_by"],
+                "created_role": t["created_role"],
+                "created_at": t["created_at"],
+                "supervisor_confirmed": bool(t["supervisor_confirmed"]),
+                "supervisor_confirmed_by": t["supervisor_confirmed_by"],
+                "qc_confirmed": bool(t["qc_confirmed"]),
+                "qc_confirmed_by": t["qc_confirmed_by"],
+                "closed_by": t["closed_by"],
+                "closed_at": t["closed_at"],
+                "box_codes": [b["box_code"] for b in boxes],
+                "evidence_list": [dict(e) for e in evidence],
+                "audit_log": [dict(a) for a in audit],
+            })
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "total_tickets": len(result_rows),
+        "tickets": result_rows,
+    }
+
+
+@app.get("/api/dispute/export/csv")
+def export_dispute_csv(status: str = None, batch_no: str = None):
+    with get_db() as conn:
+        query = "SELECT * FROM dispute_tickets"
+        conditions = []
+        params = []
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if batch_no:
+            conditions.append("batch_no = ?")
+            params.append(batch_no)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY created_at DESC"
+        tickets = conn.execute(query, params).fetchall()
+
+        fields = [
+            "ticket_id", "ticket_no", "batch_no", "status", "problem_type",
+            "evidence_desc", "responsibility_judgment", "deadline", "conclusion",
+            "require_double_confirm", "created_by", "created_role", "created_at",
+            "supervisor_confirmed", "supervisor_confirmed_by",
+            "qc_confirmed", "qc_confirmed_by",
+            "closed_by", "closed_at", "box_codes",
+        ]
+
+        output = io.StringIO()
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+
+        for t in tickets:
+            boxes = conn.execute(
+                "SELECT box_code FROM dispute_ticket_boxes WHERE ticket_id = ?",
+                (t["id"],),
+            ).fetchall()
+            row = {
+                "ticket_id": t["id"],
+                "ticket_no": t["ticket_no"],
+                "batch_no": t["batch_no"],
+                "status": t["status"],
+                "problem_type": t["problem_type"],
+                "evidence_desc": t["evidence_desc"] or "",
+                "responsibility_judgment": t["responsibility_judgment"] or "",
+                "deadline": t["deadline"] or "",
+                "conclusion": t["conclusion"] or "",
+                "require_double_confirm": bool(t["require_double_confirm"]),
+                "created_by": t["created_by"],
+                "created_role": t["created_role"],
+                "created_at": t["created_at"],
+                "supervisor_confirmed": bool(t["supervisor_confirmed"]),
+                "supervisor_confirmed_by": t["supervisor_confirmed_by"] or "",
+                "qc_confirmed": bool(t["qc_confirmed"]),
+                "qc_confirmed_by": t["qc_confirmed_by"] or "",
+                "closed_by": t["closed_by"] or "",
+                "closed_at": t["closed_at"] or "",
+                "box_codes": ";".join(b["box_code"] for b in boxes),
+            }
+            writer.writerow(row)
+
+    return StreamingResponse(
+        io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=dispute_tickets.csv"},
+    )

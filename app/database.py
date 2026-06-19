@@ -170,6 +170,95 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '待确认',
+                problem_type TEXT NOT NULL,
+                evidence_desc TEXT,
+                responsibility_judgment TEXT,
+                deadline TEXT,
+                conclusion TEXT,
+                require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                supervisor_confirmed INTEGER NOT NULL DEFAULT 0,
+                supervisor_confirmed_by TEXT,
+                supervisor_confirmed_at TEXT,
+                qc_confirmed INTEGER NOT NULL DEFAULT 0,
+                qc_confirmed_by TEXT,
+                qc_confirmed_at TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_ticket_boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                box_code TEXT NOT NULL,
+                UNIQUE(ticket_id, box_code),
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_desc TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
+            )
+            """
+        )
         _migrate_db(conn)
 
 
@@ -261,6 +350,110 @@ def _migrate_db(conn):
                 final_result TEXT,
                 UNIQUE(review_id, box_code),
                 FOREIGN KEY (review_id) REFERENCES batch_reviews(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_no TEXT UNIQUE NOT NULL,
+                batch_no TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '待确认',
+                problem_type TEXT NOT NULL,
+                evidence_desc TEXT,
+                responsibility_judgment TEXT,
+                deadline TEXT,
+                conclusion TEXT,
+                require_double_confirm INTEGER NOT NULL DEFAULT 0,
+                created_by TEXT NOT NULL,
+                created_role TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                supervisor_confirmed INTEGER NOT NULL DEFAULT 0,
+                supervisor_confirmed_by TEXT,
+                supervisor_confirmed_at TEXT,
+                qc_confirmed INTEGER NOT NULL DEFAULT 0,
+                qc_confirmed_by TEXT,
+                qc_confirmed_at TEXT,
+                rejected_at TEXT,
+                rejected_by TEXT,
+                rejected_role TEXT,
+                rejected_reason TEXT,
+                withdrawn_at TEXT,
+                withdrawn_by TEXT,
+                withdrawn_reason TEXT,
+                resubmitted_at TEXT,
+                resubmitted_by TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                closed_role TEXT
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_ticket_boxes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                box_code TEXT NOT NULL,
+                UNIQUE(ticket_id, box_code),
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                evidence_desc TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_role TEXT NOT NULL,
+                added_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispute_audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_id INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                from_status TEXT,
+                to_status TEXT,
+                role TEXT NOT NULL,
+                operator TEXT NOT NULL,
+                reason TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (ticket_id) REFERENCES dispute_tickets(id)
             )
             """
         )

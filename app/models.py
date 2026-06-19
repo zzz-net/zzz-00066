@@ -196,3 +196,63 @@ class ReviewBoxDetail(BaseModel):
     second_review_reason: Optional[str] = None
     second_review_at: Optional[str] = None
     final_result: Optional[str] = None
+
+
+class DisputeConfigUpdate(BaseModel):
+    require_double_confirm: bool
+    operator: str
+
+
+class DisputeTicketCreate(BaseModel):
+    batch_no: str
+    box_codes: List[str]
+    problem_type: str
+    evidence_desc: Optional[str] = None
+    responsibility_judgment: Optional[str] = None
+    deadline: Optional[str] = None
+    role: str
+    operator: str
+
+
+class DisputeConfirmRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class DisputeRejectRequest(BaseModel):
+    role: str
+    operator: str
+    reason: str
+
+
+class DisputeWithdrawRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class DisputeReopenRequest(BaseModel):
+    role: str
+    operator: str
+    reason: Optional[str] = None
+
+
+class DisputeResubmitRequest(BaseModel):
+    role: str
+    operator: str
+    evidence_desc: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class DisputeCloseRequest(BaseModel):
+    role: str
+    operator: str
+    conclusion: str
+    reason: Optional[str] = None
+
+
+class DisputeEvidenceRequest(BaseModel):
+    evidence_desc: str
+    role: str
+    operator: str

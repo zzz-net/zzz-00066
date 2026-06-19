@@ -38,6 +38,13 @@ python test_batch_comprehensive.py
 python test_batch_smoke.py
 ```
 
+### 交接复核全面回归测试
+
+```bash
+# 覆盖 6 大场景：正常归档、越权拦截、撤销重开、补签冲突、重启恢复、导出核对
+python test_review_comprehensive.py
+```
+
 > 所有请求体都从 `examples/*.json` 读取，避免 PowerShell / bash 之间的引号、中文编码差异。
 
 ---
@@ -387,6 +394,166 @@ python run_examples.py persistence
 | `GET` | `/api/audit` | 审计记录（`?box_code=BOX-V001` 过滤） |
 | `GET` | `/api/export/json` | **导出完整审计历史（JSON）**，包含角色/操作者/原因/时间 |
 | `GET` | `/api/export/csv` | **导出完整审计历史（CSV）**，字段与 JSON 完全一致 |
+
+---
+
+## 6.5 异常追责工单模块
+
+围绕已签收或已归档批次发起争议单，记录箱号、问题类型、证据说明、责任判断、处理时限和最终结论。
+
+### 状态机
+
+```
+                        库房签收员/仓库主管/质控
+                          创建争议单
+                              │
+                              ▼
+                          待确认 ──────── 仓库主管/质控驳回 ────────→ 已驳回
+                       │      │                                   │
+            单确认：   │      │ 双确认：                           │ 创建人
+            仓库主管确认│      │ 主管+质控都确认                   │ 重新提交
+                       │      │ 才进入处理中                       │ (补充证据)
+                       ▼      ▼                                    ▼
+                         处理中 ←─────────────────────────────── 待确认
+                      │      │
+           仓库主管/  │      │ 创建人
+           质控结案   │      │ 撤回
+                      ▼      ▼
+                    已结案  已撤回
+                              │
+                              │ 创建人重开
+                              ▼
+                            待确认
+```
+
+**角色权限**：
+
+| 动作 | 允许角色 |
+|------|---------|
+| 创建争议单 | 库房签收员、仓库主管、质控 |
+| 确认/驳回 | 仓库主管、质控（单确认模式下仅仓库主管） |
+| 补充证据 | 库房签收员、仓库主管、质控 |
+| 撤回 | 仅创建人 |
+| 重开（撤回后）| 仅创建人 |
+| 重新提交（驳回后）| 仅创建人 |
+| 结案 | 仓库主管、质控 |
+
+**防护规则**：
+
+- 重复建单拦截：同一批次有活跃（待确认/处理中）工单时，不可再创建
+- 跨批次混填拦截：箱号必须在指定批次的已签收箱子中
+- 越权结案拦截：仅仓库主管和质控可结案，签收员不可
+- 配置切换：双确认配置变更只影响新工单，已创建的工单保持创建时的配置
+
+### 异常追责工单 curl 示例
+
+```bash
+# 配置单确认模式
+curl -sS -X POST http://localhost:8000/api/dispute/config \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_config_single.json
+
+# 配置双确认模式
+curl -sS -X POST http://localhost:8000/api/dispute/config \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_config_double.json
+
+# 创建争议单
+curl -sS -X POST http://localhost:8000/api/dispute/tickets \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_create.json
+
+# 查询争议配置
+curl -sS http://localhost:8000/api/dispute/config
+
+# 列出争议工单（支持 ?status= 和 ?batch_no= 筛选）
+curl -sS "http://localhost:8000/api/dispute/tickets?status=待确认"
+curl -sS "http://localhost:8000/api/dispute/tickets?batch_no=BATCH-DSP-001"
+
+# 查看工单详情（含箱号、证据列表）
+curl -sS http://localhost:8000/api/dispute/tickets/1
+
+# 仓库主管确认
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/confirm \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_confirm.json
+
+# 质控确认（双确认模式下）
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/confirm \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_confirm_qc.json
+
+# 驳回争议单
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/reject \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_reject.json
+
+# 撤回争议单（仅创建人）
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/withdraw \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_withdraw.json
+
+# 重开争议单（仅创建人，从已撤回到待确认）
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/reopen \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_reopen.json
+
+# 重新提交（驳回后，可补充证据）
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/resubmit \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_resubmit.json
+
+# 补充证据
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/evidence \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_evidence.json
+
+# 结案（仅仓库主管/质控）
+curl -sS -X POST http://localhost:8000/api/dispute/tickets/1/close \
+  -H "Content-Type: application/json" \
+  -d @examples/dispute_close.json
+
+# 查看工单审计日志
+curl -sS http://localhost:8000/api/dispute/tickets/1/audit
+
+# 查看批次争议汇总
+curl -sS http://localhost:8000/api/dispute/batches/BATCH-DSP-001/summary
+
+# 导出争议工单 JSON（支持 ?status= 和 ?batch_no= 筛选）
+curl -sS "http://localhost:8000/api/dispute/export/json"
+curl -sS "http://localhost:8000/api/dispute/export/json?status=已结案"
+
+# 导出争议工单 CSV
+curl -sS "http://localhost:8000/api/dispute/export/csv" -o dispute_tickets.csv
+```
+
+### 异常追责工单 API 端点一览
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/dispute/config` | 查询争议配置（是否双确认） |
+| `POST` | `/api/dispute/config` | 更新争议配置（只影响新工单） |
+| `POST` | `/api/dispute/tickets` | 创建争议单 |
+| `GET` | `/api/dispute/tickets` | 工单列表（`?status=` `?batch_no=` 筛选） |
+| `GET` | `/api/dispute/tickets/{id}` | 工单详情（含箱号、证据列表） |
+| `POST` | `/api/dispute/tickets/{id}/confirm` | 确认工单 |
+| `POST` | `/api/dispute/tickets/{id}/reject` | 驳回工单 |
+| `POST` | `/api/dispute/tickets/{id}/withdraw` | 撤回工单（仅创建人） |
+| `POST` | `/api/dispute/tickets/{id}/reopen` | 重开工单（仅创建人，从已撤回） |
+| `POST` | `/api/dispute/tickets/{id}/resubmit` | 重新提交（仅创建人，从已驳回） |
+| `POST` | `/api/dispute/tickets/{id}/close` | 结案（仅仓库主管/质控） |
+| `POST` | `/api/dispute/tickets/{id}/evidence` | 补充证据 |
+| `GET` | `/api/dispute/tickets/{id}/audit` | 工单审计日志 |
+| `GET` | `/api/dispute/batches/{batch_no}/summary` | 批次争议汇总 |
+| `GET` | `/api/dispute/export/json` | 导出争议工单 JSON |
+| `GET` | `/api/dispute/export/csv` | 导出争议工单 CSV |
+
+### 异常追责工单回归测试
+
+```bash
+# 覆盖 6 大场景：正常闭环、越权拦截、撤回重开、配置切换、重启恢复、导出核对
+python test_dispute_comprehensive.py
+```
 
 ---
 
